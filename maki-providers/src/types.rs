@@ -684,6 +684,15 @@ impl EffortDialect<'_> {
 /// [`declared_fragment`].
 pub use maki_config::providers::ThinkingFields;
 
+fn declared_effort(fields: &ThinkingFields, level: Effort) -> Option<Effort> {
+    fields
+        .levels
+        .range(..=level)
+        .next_back()
+        .or_else(|| fields.levels.first_key_value())
+        .map(|(&level, _)| level)
+}
+
 /// What a request says when the model's fields do not spell the mode asked
 /// for. The fragment merge is identical everywhere, only this last step
 /// differs, so paths hand it in rather than each growing their own apply fn.
@@ -704,9 +713,8 @@ impl ThinkingFallback {
     /// endpoint is left to decide.
     pub(crate) fn adaptive_effort(self, model: &Model) -> Option<Effort> {
         let spelled = model
-            .thinking_fields
-            .as_ref()
-            .is_some_and(|fields| fields.adaptive.is_some());
+            .effective_thinking_fields()
+            .is_some_and(|(fields, _)| fields.adaptive.is_some());
         match self {
             Self::Dialect(dialect) if !spelled => dialect.adaptive_effort(),
             Self::None | Self::Dialect(_) | Self::BudgetField => None,
@@ -714,34 +722,53 @@ impl ThinkingFallback {
     }
 }
 
-/// The fragment that spells `thinking` for this model, if it has one. Effort
-/// levels snap to the declared ones, so a level the model never advertised is
-/// never sent, while `off` and `adaptive` need explicit keys and never snap. A
-/// token budget picks the level it lands on. A model that declares no levels
-/// at all gets `adaptive` and keeps the count, which is what the returned flag
-/// asks the caller to send alongside.
-fn declared_fragment(
+/// The setting the native fragment sends. Budgets survive only where the
+/// adapter can forward them alongside a toggle.
+fn declared_thinking(
     fields: &ThinkingFields,
     thinking: ThinkingConfig,
-    max: Option<u32>,
-) -> Option<(&Map<String, Value>, bool)> {
+    model: &Model,
+    fallback: ThinkingFallback,
+) -> Option<ThinkingConfig> {
     let level = match thinking {
-        ThinkingConfig::Off => return fields.off.as_ref().map(|f| (f, false)),
-        ThinkingConfig::Adaptive => return fields.adaptive.as_ref().map(|f| (f, false)),
+        ThinkingConfig::Off => return fields.off.as_ref().map(|_| thinking),
+        ThinkingConfig::Adaptive => return fields.adaptive.as_ref().map(|_| thinking),
         ThinkingConfig::Effort(level) => level,
         ThinkingConfig::Budget(n) => {
             if fields.levels.is_empty() {
-                return fields.adaptive.as_ref().map(|f| (f, true));
+                return fields.adaptive.as_ref().map(|_| match fallback {
+                    ThinkingFallback::BudgetField => thinking,
+                    ThinkingFallback::None | ThinkingFallback::Dialect(_) => {
+                        ThinkingConfig::Adaptive
+                    }
+                });
             }
-            Effort::from_budget(n, max.unwrap_or(FALLBACK_MAX_THINKING_BUDGET))
+            Effort::from_budget(
+                n,
+                model
+                    .max_thinking_budget()
+                    .unwrap_or(FALLBACK_MAX_THINKING_BUDGET),
+            )
         }
     };
-    let declared: Vec<Effort> = fields.levels.keys().copied().collect();
-    fields
-        .levels
-        .get(&level.snap(&declared))
-        .or(fields.adaptive.as_ref())
-        .map(|f| (f, false))
+    declared_effort(fields, level)
+        .map(ThinkingConfig::Effort)
+        .or_else(|| fields.adaptive.as_ref().map(|_| ThinkingConfig::Adaptive))
+}
+
+fn declared_fragment<'a>(
+    fields: &'a ThinkingFields,
+    thinking: ThinkingConfig,
+    model: &Model,
+    fallback: ThinkingFallback,
+) -> Option<(&'a Map<String, Value>, bool)> {
+    let resolved = declared_thinking(fields, thinking, model, fallback)?;
+    let fragment = match resolved {
+        ThinkingConfig::Off => fields.off.as_ref(),
+        ThinkingConfig::Adaptive | ThinkingConfig::Budget(_) => fields.adaptive.as_ref(),
+        ThinkingConfig::Effort(level) => fields.levels.get(&level),
+    }?;
+    Some((fragment, matches!(resolved, ThinkingConfig::Budget(_))))
 }
 
 pub(crate) fn merge_body(body: &mut Map<String, Value>, fragment: &Map<String, Value>) {
@@ -1075,7 +1102,7 @@ impl ThinkingConfig {
         fallback: ThinkingFallback,
     ) -> bool {
         let max = model.max_thinking_budget();
-        let Some((fragment, keep_budget)) = declared_fragment(fields, self, max) else {
+        let Some((fragment, keep_budget)) = declared_fragment(fields, self, model, fallback) else {
             return false;
         };
         let Some(object) = body.as_object_mut() else {
@@ -1154,12 +1181,9 @@ impl ThinkingConfig {
         }
     }
 
-    /// The status bar already wraps this in brackets, so a level just names
-    /// itself. A raw count keeps its unit, or it reads like any other number
-    /// up there.
-    /// What the model will really run, so stored state can never disagree with
-    /// the request. Clamps both ways: down to `Off` where thinking is
-    /// unsupported, up to minimal effort where it is mandatory.
+    /// Enforces thinking support without rewriting enabled intent. Effort
+    /// stays a delegation ceiling even when the wire snaps it to a native
+    /// level or sends a toggle. [`Self::shown`] resolves the displayed choice.
     pub fn clamped(self, model: &Model) -> Self {
         if !model.supports_thinking() {
             return Self::Off;
@@ -1170,12 +1194,17 @@ impl ThinkingConfig {
         self
     }
 
-    /// What the picker and the status bar call this config: `Adaptive` reads
-    /// as the level the provider sends for it where the API has no adaptive
-    /// mode. Display only. The session keeps `Adaptive`, which sets a
-    /// subagent no ceiling ([`Self::clamp_to`]) where a level would.
+    /// The picker and badge follow the wire while stored intent keeps its
+    /// delegation ceiling. Declared fields keep `Adaptive` separate because
+    /// their level fragments can differ from the provider fallback.
     pub fn shown(self, model: &Model) -> Self {
-        if self == Self::Adaptive {
+        let fields = model.effective_thinking_fields();
+        if let Some((fields, fallback)) = fields
+            && let Some(shown) = declared_thinking(fields, self, model, fallback)
+        {
+            return shown;
+        }
+        if self == Self::Adaptive && fields.is_none_or(|(fields, _)| fields.levels.is_empty()) {
             return model.adaptive_effort().map_or(self, Self::Effort);
         }
         self
@@ -1748,7 +1777,7 @@ mod tests {
         assert!(!Arc::ptr_eq(&first.data, &read(INTERNED_DATA).data));
     }
 
-    use Effort::{High, Low, Max, Minimal, XHigh};
+    use Effort::{High, Low, Max, Medium, Minimal, XHigh};
 
     /// `max_output_tokens: 8192`, so `max_thinking_budget()` is 4096.
     fn thinking_model(id: &str) -> crate::model::Model {
@@ -1760,6 +1789,7 @@ mod tests {
 
     fn native_thinking_model(id: &str, fields: Value) -> crate::model::Model {
         let mut model = thinking_model(id);
+        model.provider = Arc::from("llama-cpp");
         model.thinking_fields = Some(Box::new(serde_json::from_value(fields).unwrap()));
         model
     }
@@ -2036,6 +2066,46 @@ mod tests {
         assert_eq!(body, expected);
     }
 
+    #[test_case(ThinkingConfig::Effort(Minimal), ThinkingConfig::Effort(Low) ; "below_lowest")]
+    #[test_case(ThinkingConfig::Effort(Low), ThinkingConfig::Effort(Low) ; "declared_level")]
+    #[test_case(ThinkingConfig::Effort(High), ThinkingConfig::Effort(Medium) ; "gap_snaps_down")]
+    #[test_case(ThinkingConfig::Effort(Max), ThinkingConfig::Effort(XHigh) ; "above_highest")]
+    #[test_case(ThinkingConfig::Adaptive, ThinkingConfig::Adaptive ; "adaptive_stays")]
+    #[test_case(ThinkingConfig::Off, ThinkingConfig::Off ; "off_stays")]
+    #[test_case(ThinkingConfig::Budget(SMALL_BUDGET), ThinkingConfig::Effort(Medium) ; "budget_shows_its_native_level")]
+    #[test_case(ThinkingConfig::Budget(LARGE_BUDGET), ThinkingConfig::Effort(XHigh) ; "large_budget_shows_highest_native_level")]
+    fn shown_native_thinking_matches_the_encoded_level_without_rewriting_intent(
+        requested: ThinkingConfig,
+        expected: ThinkingConfig,
+    ) {
+        let model = native_effort_model();
+        assert_eq!(requested.clamped(&model), requested);
+        assert_eq!(requested.shown(&model), expected);
+        let mut original = json!({});
+        let mut normalized = json!({});
+        requested.apply_thinking(&mut original, &model, ThinkingFallback::BudgetField);
+        expected.apply_thinking(&mut normalized, &model, ThinkingFallback::BudgetField);
+        assert_eq!(original, normalized);
+    }
+
+    #[test_case(Some(8192), SMALL_BUDGET, Medium ; "declared_output_cap")]
+    #[test_case(None, SMALL_BUDGET, Low ; "unknown_cap_uses_encoder_fallback")]
+    #[test_case(Some(8192), LARGE_BUDGET, XHigh ; "budget_above_cap")]
+    fn typed_native_budget_keeps_its_ceiling_but_shows_the_encoded_level(
+        max_output_tokens: Option<u32>,
+        budget: u32,
+        expected: Effort,
+    ) {
+        let mut model = native_effort_model();
+        model.max_output_tokens = max_output_tokens;
+        let thinking = ThinkingConfig::Budget(budget);
+        assert_eq!(thinking.clamped(&model), thinking);
+        assert_eq!(thinking.shown(&model), ThinkingConfig::Effort(expected));
+        let mut body = json!({});
+        thinking.apply_thinking(&mut body, &model, ThinkingFallback::BudgetField);
+        assert_eq!(body, json!({"reasoning_effort": expected.as_str()}));
+    }
+
     #[test]
     fn local_required_thinking_maps_off_to_lowest_native_effort() {
         let mut model = native_effort_model();
@@ -2046,6 +2116,8 @@ mod tests {
         }
         .clamped(&model)
         .thinking;
+        assert_eq!(thinking, ThinkingConfig::Effort(Minimal));
+        assert_eq!(thinking.shown(&model), ThinkingConfig::Effort(Low));
         let mut body = json!({});
         thinking.apply_thinking(&mut body, &model, ThinkingFallback::BudgetField);
         assert_eq!(body, json!({"reasoning_effort": "low"}));
@@ -2066,6 +2138,59 @@ mod tests {
         let mut body = json!({"chat_template_kwargs": {"keep": 1}});
         config.apply_thinking(&mut body, &model, ThinkingFallback::BudgetField);
         assert_eq!(body, expected);
+    }
+
+    #[test_case("llama-cpp", None, ThinkingConfig::Budget(LARGE_BUDGET), Some(4096) ; "llama_cpp_sends_a_clamped_count")]
+    #[test_case("llama-cpp", Some(SMALL_BUDGET), ThinkingConfig::Budget(LARGE_BUDGET), Some(1024) ; "llama_cpp_respects_the_turn_cap")]
+    #[test_case("ollama", None, ThinkingConfig::Adaptive, None ; "ollama_sends_only_the_toggle")]
+    #[test_case("openai", None, ThinkingConfig::Adaptive, None ; "openai_chat_sends_only_the_toggle")]
+    fn toggle_budget_is_shown_only_when_the_adapter_forwards_it(
+        provider: &str,
+        turn_output_tokens: Option<u32>,
+        expected: ThinkingConfig,
+        sent_budget: Option<u32>,
+    ) {
+        let mut model = native_thinking_model(
+            "local-toggle-model",
+            json!({"adaptive": {"enable_thinking": true}}),
+        );
+        model.provider = Arc::from(provider);
+        model.thinking_override = Some(Support::Yes);
+        model.turn_output_tokens = turn_output_tokens;
+        let thinking = ThinkingConfig::Budget(LARGE_BUDGET);
+        assert_eq!(thinking.clamped(&model), thinking);
+        assert_eq!(thinking.shown(&model), expected);
+        let (_, fallback) = model.effective_thinking_fields().unwrap();
+        let mut body = json!({});
+        thinking.apply_thinking(&mut body, &model, fallback);
+        let mut expected_body = json!({"enable_thinking": true});
+        if let Some(budget) = sent_budget {
+            expected_body[LOCAL_BUDGET_FIELD] = json!(budget);
+        }
+        assert_eq!(body, expected_body);
+    }
+
+    #[test_case(Support::Yes, ThinkingConfig::Off, ThinkingConfig::Off ; "optional_off")]
+    #[test_case(Support::Required, ThinkingConfig::Off, ThinkingConfig::Adaptive ; "required_off_enables_toggle")]
+    #[test_case(Support::Yes, ThinkingConfig::Effort(High), ThinkingConfig::Adaptive ; "effort_uses_toggle")]
+    #[test_case(Support::Yes, ThinkingConfig::Adaptive, ThinkingConfig::Adaptive ; "adaptive_stays")]
+    #[test_case(Support::Yes, ThinkingConfig::Budget(SMALL_BUDGET), ThinkingConfig::Budget(SMALL_BUDGET) ; "explicit_budget_stays")]
+    #[test_case(Support::No, ThinkingConfig::Adaptive, ThinkingConfig::Off ; "unsupported_stays_off")]
+    fn shown_toggle_thinking_uses_only_the_declared_modes(
+        support: Support,
+        requested: ThinkingConfig,
+        expected: ThinkingConfig,
+    ) {
+        let mut model = native_thinking_model(
+            "local-toggle-model",
+            json!({
+                "off": {"enable_thinking": false},
+                "adaptive": {"enable_thinking": true}
+            }),
+        );
+        model.thinking_override = Some(support);
+        let clamped = requested.clamped(&model);
+        assert_eq!(clamped.shown(&model), expected);
     }
 
     /// A mode the model has no fragment for must still reach the server, so
@@ -2165,13 +2290,16 @@ mod tests {
 
     /// A model that spells `adaptive` itself keeps the mode, whatever the
     /// provider's dialect would have sent.
-    #[test_case(json!({"high": {"reasoning_effort": "xhigh"}}), Some(Effort::Medium) ; "unspelled_takes_the_dialect_level")]
-    #[test_case(json!({"adaptive": {"reasoning_effort": "auto"}}), None ; "spelled_stays_adaptive")]
+    #[test_case("llama-cpp", json!({"high": {"reasoning_effort": "xhigh"}}), Some(Effort::Medium) ; "unspelled_takes_the_dialect_level")]
+    #[test_case("llama-cpp", json!({"adaptive": {"reasoning_effort": "auto"}}), None ; "spelled_stays_adaptive")]
+    #[test_case("zai", json!({"adaptive": {"reasoning_effort": "auto"}}), Some(Effort::Medium) ; "inactive_fields_do_not_hide_the_fixed_mode")]
     fn fallback_adaptive_effort_defers_to_the_models_own_fields(
+        provider: &str,
         fields: Value,
         expected: Option<Effort>,
     ) {
-        let model = native_thinking_model("partial", fields);
+        let mut model = native_thinking_model("partial", fields);
+        model.provider = Arc::from(provider);
         assert_eq!(DIALECT.adaptive_effort(&model), expected);
         assert_eq!(ThinkingFallback::None.adaptive_effort(&model), None);
     }

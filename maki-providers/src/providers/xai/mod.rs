@@ -38,6 +38,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     supports_thinking: true,
     supports_deferred_tools: false,
     adaptive_effort: |_| dialect::GROK.adaptive_effort(),
+    thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(GROK_MAX_OUTPUT_TOKENS),
     fallback_context_window: 500_000,

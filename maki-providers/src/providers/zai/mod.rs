@@ -74,6 +74,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     supports_thinking: false,
     supports_deferred_tools: false,
     adaptive_effort: |_| dialect::GLM.adaptive_effort(),
+    thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: false,
     fallback_max_output: Some(16_000),
     fallback_context_window: 128_000,

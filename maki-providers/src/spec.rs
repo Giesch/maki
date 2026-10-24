@@ -11,6 +11,7 @@ use crate::providers::{
     ResolvedAuth, Timeouts, anthropic, aperture, copilot, custom, google, llama_cpp, ollama,
     openai, opencode, plugin, xai, zai,
 };
+use crate::types::ThinkingFallback;
 use crate::{AgentError, Effort};
 
 /// The slugs a plugin may name as its `base`, in documentation order. A `base`
@@ -62,6 +63,10 @@ pub struct ProviderSpec {
     /// picks the depth itself. A fn, because one provider can serve both
     /// kinds of model. Read through [`Model::adaptive_effort`].
     pub adaptive_effort: fn(&Model) -> Option<Effort>,
+    /// How the selected endpoint handles modes outside `thinking_fields`.
+    /// `None` ignores the fields, `Some` names their fallback. This also says
+    /// whether a toggle fragment can carry an explicit token budget.
+    pub thinking_fields_fallback: fn(&Model) -> Option<ThinkingFallback>,
     pub accepts_arbitrary_models: bool,
     pub fallback_max_output: Option<u32>,
     pub fallback_context_window: u32,

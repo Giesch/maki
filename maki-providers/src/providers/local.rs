@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
 
-use maki_config::providers::Protocol;
+use maki_config::providers::{Protocol, ProvidersConfig};
 
 use crate::model::Model;
 use crate::provider::{BoxFuture, Provider};
@@ -35,6 +35,14 @@ pub(crate) struct LocalEndpointConfig {
 impl LocalEndpointConfig {
     pub(crate) fn adaptive_effort(&self, model: &Model) -> Option<Effort> {
         self.thinking_fallback.adaptive_effort(model)
+    }
+
+    pub(crate) fn fields_fallback(&self) -> Option<ThinkingFallback> {
+        (maki_config::providers::resolve_protocol(
+            self.slug,
+            ProvidersConfig::load_or_default().get(self.slug),
+        ) != Some(Protocol::OpenaiResponses))
+        .then_some(self.thinking_fallback)
     }
 }
 
