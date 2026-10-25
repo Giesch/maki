@@ -48,8 +48,9 @@ The rules:
 
 - No `plugin.toml` at all: every permission is denied, and maki logs a
   warning at load time.
-- `plugin.toml` exists: permissions default to granted; set a key to
-  `false` to revoke it. An empty file grants everything.
+- A local `plugin.toml` grants execution permissions by default. Set a key to
+  `false` to revoke it. `permission_review_read` requires an explicit `true`,
+  so an empty file does not grant read-review authority.
 - Invalid TOML: everything denied, with a warning in the log.
 - A package, or a plugin maki ships, is read the other way round: a key it
   does not name is not requested, so its `plugin.toml` lists everything it

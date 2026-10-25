@@ -16,6 +16,586 @@ use maki_lua::{
 use maki_storage::id::MakiId;
 use test_case::test_case;
 
+mod read_routing_acceptance {
+    use arc_swap::ArcSwap;
+    use maki_agent::AgentMode;
+    use maki_agent::agent::{History, HistorySnapshot, SharedMessages, publish_live_history};
+    use maki_agent::permissions::PermissionManager;
+    use maki_agent::tools::test_support::stub_ctx;
+    use maki_agent::tools::{CallOrigin, ToolContext, ToolRegistry};
+    use maki_config::{
+        Effect, PermissionRule, PermissionsConfig, PluginsConfig, ProjectConfig, ToolKey,
+    };
+    use maki_lua::{Permission, PluginHost, PluginPermissions};
+    use maki_providers::Message;
+    use maki_storage::id::{MakiId, SessionRef};
+    use serde_json::json;
+    use std::sync::Arc;
+    use test_case::test_case;
+
+    struct Fixture {
+        host: PluginHost,
+        ctx: ToolContext,
+        history: History,
+        _mirror: SharedMessages,
+        dir: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        fn new(layer: &str) -> Self {
+            Self::with_read(layer, false)
+        }
+
+        fn with_read(layer: &str, bundled: bool) -> Self {
+            let registry = Arc::new(ToolRegistry::new());
+            let mut host = PluginHost::new(Arc::clone(&registry)).unwrap();
+            if bundled {
+                host.load_builtins(&PluginsConfig {
+                    enabled: true,
+                    names: vec!["read".into()],
+                    packages: Vec::new(),
+                    opts: Default::default(),
+                })
+                .unwrap();
+            } else {
+                host.load_source("read", "maki.api.register_tool({name='read',description='Synthetic no-scope read',permission='fs_read',schema={type='object',properties={path={type='string'}}},handler=function() return 'synthetic read ran' end})").unwrap();
+            }
+            let mut permissions = PluginPermissions::denied();
+            permissions.set(Permission::Agent, true);
+            permissions.set(Permission::Run, true);
+            permissions.set(Permission::PermissionReviewRead, true);
+            host.load_source("probe", "local check=maki.api.declare_slot('fixture.check',function() error('observer missing') end,{capability={}}) maki.api.register_tool({name='check_observer',description='Check fixture',schema={type='object'},handler=function() assert(check()) return 'verified' end})").unwrap();
+            host.load_source_with_permissions("review", layer, permissions)
+                .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            for name in ["first.txt", "second.txt"] {
+                std::fs::write(dir.path().join(name), "synthetic fixture").unwrap();
+            }
+            let manager = Arc::new(PermissionManager::new(
+                PermissionsConfig::default(),
+                dir.path().into(),
+                ProjectConfig::discover(dir.path()),
+                Arc::default(),
+            ));
+            let mut ctx = stub_ctx(&AgentMode::Build);
+            ctx.permissions = manager;
+            ctx.registry = registry;
+            let id = MakiId::generate();
+            ctx.session_id = Some(SessionRef::from_id(id));
+            let mirror = Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(Vec::new())));
+            let mut history = History::new(Vec::new()).with_mirror(Arc::clone(&mirror));
+            history.push(Message {
+                human_prompt: Some("Read the synthetic fixture.".into()),
+                ..Message::user("Read the synthetic fixture.".into())
+            });
+            publish_live_history(id, &mirror);
+
+            Self {
+                host,
+                ctx,
+                history,
+                _mirror: mirror,
+                dir,
+            }
+        }
+
+        fn call(&self, tool: &str, input: serde_json::Value) -> bool {
+            let done = super::within(maki_agent::agent::tool_dispatch::run(
+                "fixture-call".into(),
+                tool,
+                &input,
+                &self.ctx,
+                CallOrigin::Model,
+            ));
+
+            !done.is_error
+        }
+
+        fn read(&self, file: &str) -> bool {
+            self.call("read", json!({"path":self.dir.path().join(file)}))
+        }
+    }
+
+    #[test]
+    fn fresh_observer_routes_without_classifier_or_reviewer_fs_grant() {
+        let fixture = Fixture::new(
+            r#"
+local calls=0
+local valid=false
+maki.api.set_slot('permission.prompt',function(prev,req,ctx)
+ calls=calls+1
+ valid=req.permission.classifier.consecutive_denials==0
+  and not req.permission.classifier.exact_grant_available
+  and req.permission.classifier.exact_grant_supported
+ return prev(req,ctx)
+end,{route_absolute_reads=true})
+maki.api.set_slot('fixture.check',function() assert(calls==1 and valid,'observer must see fresh real binding exactly once') return true end)
+"#,
+        );
+        assert!(!fixture.read("first.txt"));
+        assert!(fixture.ctx.permissions.session_rules_snapshot().is_empty());
+        assert!(fixture.call("check_observer", json!({})));
+        assert!(!fixture.read(".env"));
+        assert!(
+            fixture.call("check_observer", json!({})),
+            "guard skips observer"
+        );
+        fixture.ctx.permissions.add_session_rule(PermissionRule {
+            tool: ToolKey::native("read"),
+            scope: None,
+            effect: Effect::Deny,
+        });
+        assert!(!fixture.read("first.txt"));
+        assert!(
+            fixture.call("check_observer", json!({})),
+            "explicit deny skips observer"
+        );
+    }
+
+    #[test]
+    fn review_authority_does_not_grant_filesystem_or_tool_hooks() {
+        let fixture = Fixture::new(
+            r#"
+local calls=0
+for _,slot in ipairs({'tool.read.input','tool.read.output','tool.read'}) do
+ maki.api.set_slot(slot,function() error('read tool hook must stay gated') end)
+end
+maki.api.set_slot('permission.prompt',function(prev,req)
+ calls=calls+1
+ local ok,err=pcall(function() return maki.fs.read(req.input.path) end)
+ assert(not ok and tostring(err):find('fs_read',1,true))
+ return {decision='allow'}
+end,{route_absolute_reads=true})
+maki.api.set_slot('fixture.check',function() assert(calls==1) return true end)
+"#,
+        );
+        fixture.host.load_source("other", "maki.api.register_tool({name='other_read',description='Unrelated filesystem tool',permission='fs_read',schema={type='object'},permission_scopes=function() return {scopes={'unapproved'}} end,handler=function() return 'must not run' end})").unwrap();
+        assert!(fixture.read("first.txt"));
+        assert!(!fixture.read(".env"));
+        assert!(!fixture.call("other_read", json!({})));
+        assert!(fixture.call("check_observer", json!({})));
+    }
+
+    #[test_case("maki.api.register_tool({name='review_only_tool',description='Invalid authority',permission='permission_review_read',schema={type='object'},handler=function() error('must not run') end})"; "tool")]
+    #[test_case("maki.api.declare_slot('review_only.slot',function() error('must not run') end,{capability={'permission_review_read'}})"; "custom_slot")]
+    fn review_grant_cannot_declare_execution_authority(declaration: &str) {
+        let fixture = Fixture::new("");
+        let mut permissions = PluginPermissions::denied();
+        permissions.set(Permission::PermissionReviewRead, true);
+        let source = format!(
+            "local ok,err=pcall(function() {declaration} end) assert(not ok and tostring(err):find('permission_review_read',1,true)) assert(maki.api.get_slots()['review_only.slot']==nil)"
+        );
+        fixture
+            .host
+            .load_source_with_permissions("invalid-authority", &source, permissions)
+            .unwrap();
+        assert!(!fixture.call("review_only_tool", json!({})));
+        assert!(fixture.read("first.txt"));
+    }
+
+    #[test]
+    fn routing_requires_explicit_review_authority() {
+        let fixture = Fixture::new("");
+        let mut permissions = PluginPermissions::denied();
+        permissions.set(Permission::Agent, true);
+        permissions.set(Permission::Run, true);
+        let result = fixture.host.load_source_with_permissions(
+            "unapproved-review",
+            "maki.api.set_slot('permission.prompt',function() return {decision='allow'} end,{route_absolute_reads=true})",
+            permissions,
+        );
+        assert!(result.is_err());
+        assert!(fixture.read("first.txt"));
+    }
+
+    #[test]
+    fn bounded_shell_reaches_classifier_and_hazards_dominate_allow() {
+        let fixture = Fixture::new(
+            r#"
+local calls=0
+maki.api.set_slot('permission.prompt',function(prev,req,ctx)
+ calls=calls+1
+ local expected={'cargo test --offline -p fixture --lib','cargo build --locked --release','cargo check --all-targets','cargo clippy -p fixture'}
+ assert(req.tool=='bash' and req.input.command==expected[calls])
+ assert(not req.permission.classifier.exact_grant_supported)
+ return {decision='allow',classifier=true,policy_version='shell-fixture'}
+end)
+maki.api.set_slot('fixture.check',function() assert(calls==4) return true end)
+"#,
+        );
+        std::fs::write(
+            fixture.dir.path().join("Cargo.toml"),
+            "[package]\nname='fixture'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fixture.host.load_source("bash", r#"maki.api.register_tool({name='bash',description='Synthetic shell',permission='run',schema={type='object'},permission_scopes=function(input) return {scopes={input.command}} end,handler=function() return 'synthetic shell ran' end})"#).unwrap();
+        let call = |command: &str, workdir: serde_json::Value| {
+            fixture.call("bash", json!({"command":command,"workdir":workdir}))
+        };
+        assert!(call(
+            "cargo test --offline -p fixture --lib",
+            json!(fixture.dir.path())
+        ));
+        for command in [
+            "cargo build --locked --release",
+            "cargo check --all-targets",
+            "cargo clippy -p fixture",
+        ] {
+            assert!(call(command, json!(fixture.dir.path())));
+        }
+        fixture.ctx.permissions.add_session_rule(PermissionRule {
+            tool: ToolKey::native("bash"),
+            scope: None,
+            effect: Effect::Allow,
+        });
+        for command in [
+            "cargo test; rm -rf /",
+            "cargo test && curl https://example.invalid",
+            "cargo test | sh",
+            "cargo test > output",
+            "cargo test $(cat .env)",
+            "cargo test `env`",
+            "cargo test $TOKEN",
+            "cargo test\nrm -rf /",
+            "cd /tmp && cargo test",
+            "env cargo test",
+            "sudo cargo test",
+            "cargo --config x test",
+            "cargo test --config x",
+            "cargo test --target-dir /tmp/x",
+            "cargo test --manifest-path /tmp/Cargo.toml",
+            "cargo test -- --nocapture",
+            "cargo +nightly test",
+            "cargo publish",
+            "curl https://example.invalid",
+            "cat .env",
+            "printenv",
+            "rm -rf target",
+            "cargo test --features 'x'",
+            "cargo test --features x/y",
+            "cargo test --unknown",
+        ] {
+            assert!(
+                !call(command, json!(fixture.dir.path())),
+                "guard must win: {command}"
+            );
+            fixture.ctx.permissions.set_session_yolo(Some(true));
+            assert!(
+                !call(command, json!(fixture.dir.path())),
+                "YOLO guard: {command}"
+            );
+            fixture.ctx.permissions.set_session_yolo(Some(false));
+        }
+        assert!(!call("cargo test", json!("relative")));
+        assert!(!call(
+            "cargo test",
+            json!(fixture.dir.path().join("missing"))
+        ));
+        fixture.host.load_source("escalation", "maki.api.set_slot('tool.bash.input',function(prev,input,ctx) return prev(input,ctx), {ask='Explicit human review'} end)").unwrap();
+        assert!(!call("cargo test", json!(fixture.dir.path())));
+        fixture.ctx.permissions.add_session_rule(PermissionRule {
+            tool: ToolKey::native("bash"),
+            scope: None,
+            effect: Effect::Deny,
+        });
+        assert!(!call("cargo test", json!(fixture.dir.path())));
+        assert!(fixture.call("check_observer", json!({})));
+    }
+
+    #[test]
+    fn absent_opt_in_preserves_unscoped_read_bypass() {
+        let fixture = Fixture::new(
+            "maki.api.set_slot('permission.prompt',function() error('must not route') end)",
+        );
+        assert!(fixture.read("first.txt"));
+    }
+
+    #[test]
+    fn registration_acknowledges_requested_option_not_sticky_routing() {
+        let fixture = Fixture::new(
+            r#"
+local wrapper=function(prev,req,ctx) return prev(req,ctx) end
+local function check(ack,expected)
+ assert(type(ack)=='table' and ack.route_absolute_reads==expected)
+ local count=0
+ for key in pairs(ack) do assert(key=='route_absolute_reads') count=count+1 end
+ assert(count==1)
+end
+check(maki.api.set_slot('permission.prompt',wrapper,{route_absolute_reads=true}),true)
+check(maki.api.set_slot('permission.prompt',wrapper),false)
+check(maki.api.set_slot('permission.prompt',wrapper,{route_absolute_reads=false}),false)
+local ack=nil
+local ok=pcall(function() ack=maki.api.set_slot('tool.read.input',wrapper,{route_absolute_reads=true}) end)
+assert(not ok and ack==nil)
+check(maki.api.set_slot('fixture.check',function() return true end),false)
+"#,
+        );
+        assert!(
+            !fixture.read("first.txt"),
+            "routing published despite later false acknowledgements"
+        );
+        assert!(fixture.call("check_observer", json!({})));
+        fixture.host.load_source("review", "local ack=maki.api.set_slot('permission.prompt',function(prev,req,ctx) return prev(req,ctx) end) assert(type(ack)=='table' and ack.route_absolute_reads==false)").unwrap();
+        assert!(
+            fixture.read("first.txt"),
+            "replacement clears acknowledged routing"
+        );
+    }
+
+    #[test_case(""; "omitted")]
+    #[test_case(",{route_absolute_reads=false}"; "false")]
+    fn later_registration_does_not_revoke_existing_routing(options: &str) {
+        let fixture = Fixture::new(&format!(
+            "local wrapper=function(prev,req,ctx) return prev(req,ctx) end maki.api.set_slot('permission.prompt',wrapper,{{route_absolute_reads=true}}) maki.api.set_slot('permission.prompt',wrapper{options})"
+        ));
+        assert!(!fixture.read("first.txt"));
+        fixture.host.load_source("review", "maki.api.set_slot('permission.prompt',function(prev,req,ctx) return prev(req,ctx) end,{route_absolute_reads=false})").unwrap();
+        assert!(
+            fixture.read("first.txt"),
+            "plugin replacement clears its prior opt-in"
+        );
+    }
+
+    #[test_case("maki.api.set_slot('tool.read.input',function(prev,req,ctx) return prev(req,ctx) end,{route_absolute_reads=true})"; "unsupported_slot")]
+    #[test_case("maki.api.set_slot('permission.prompt',function() end,{route_absolute_reads='true'})"; "wrong_option_type")]
+    #[test_case("maki.api.set_slot('permission.prompt',function() end,{route_absolute_reads=0})"; "numeric_option")]
+    #[test_case("maki.api.set_slot('permission.prompt',function() end,{route_absolute_reads={}})"; "table_option")]
+    #[test_case("maki.api.set_slot('permission.prompt',function() end,true)"; "wrong_options_type")]
+    fn invalid_routing_options_do_not_enable_routing(source: &str) {
+        let fixture = Fixture::new("");
+        assert!(fixture.host.load_source("invalid", source).is_err());
+        assert!(fixture.read("first.txt"));
+    }
+
+    #[test_case(""; "omitted")]
+    #[test_case(",{route_absolute_reads=false}"; "false")]
+    fn unsupported_slot_without_opt_in_preserves_legacy_registration(options: &str) {
+        let fixture = Fixture::new(&format!(
+            "maki.api.set_slot('tool.read.input',function(prev,req,ctx) return prev(req,ctx) end{options})"
+        ));
+        assert!(fixture.read("first.txt"));
+    }
+
+    #[test]
+    fn routing_aggregates_loaded_plugins_and_relative_reads_keep_legacy_behavior() {
+        let source = "maki.api.set_slot('permission.prompt',function(prev,req,ctx) return prev(req,ctx) end,{route_absolute_reads=true})";
+        let fixture = Fixture::new(source);
+        fixture.host.load_source("second-review", source).unwrap();
+        assert!(!fixture.read("first.txt"));
+        assert!(
+            fixture.call("read", json!({"path":"relative-fixture.txt"})),
+            "opt-in routes absolute reads only"
+        );
+        assert!(
+            !fixture.call("read", json!({"path":".env"})),
+            "relative secret guards still apply"
+        );
+        fixture.host.load_source("review", "").unwrap();
+        assert!(!fixture.read("first.txt"), "another plugin still opts in");
+        fixture.host.load_source("second-review", "").unwrap();
+        assert!(
+            fixture.read("first.txt"),
+            "last opting-in plugin removal clears routing"
+        );
+    }
+
+    #[test]
+    fn unload_removes_observer_routing() {
+        let fixture = Fixture::new(
+            "maki.api.set_slot('permission.prompt',function(prev,req,ctx) return prev(req,ctx) end,{route_absolute_reads=true})",
+        );
+        assert!(!fixture.read("first.txt"));
+        fixture
+            .host
+            .load_source_with_permissions("review", "", PluginPermissions::denied())
+            .unwrap();
+        assert!(fixture.read("first.txt"));
+    }
+
+    const BENIGN_CONTENT: &str = "first benign line\nsecond benign line\nthird benign line\n";
+    const SELECTED_CONTENT: &str = "2: second benign line\n3: third benign line";
+    const BUNDLED_REVIEW: &str = r#"
+local reviews,classifications,revision=0,0,nil
+local validator=assert(maki.json.schema_validator({
+ type='object',required={'decision'},additionalProperties=false,
+ properties={decision={type='string',enum={'allow','deny'}}},
+}))
+maki.api.set_slot('permission.prompt',function(prev,req,ctx)
+ reviews=reviews+1
+ local history,err=maki.session.user_prompts({session=ctx:session_id(),max_bytes=16384})
+ assert(err==nil and history.session==ctx:session_id())
+ assert(req.tool=='read')
+ if reviews>1 then
+  if reviews==2 then
+   assert(history.complete and history.revision==revision)
+   assert(req.permission.classifier.exact_grant_available)
+  end
+  local policy=POLICY_CHANGE and reviews>2 and 'bundled-v2' or 'bundled-v1'
+  return {decision='allow',classifier=true,reuse_grant=true,policy_version=policy}
+ end
+ assert(history.complete and #history.prompts==1)
+ revision=history.revision
+ classifications=classifications+1
+ -- Deterministic validated output exercises enforcement, not model accuracy.
+ local response=assert(maki.json.decode('{"decision":"allow"}'))
+ assert(validator:validate(response)==nil)
+ return {decision=response.decision,classifier=true,exact_grant=true,policy_version='bundled-v1'}
+end,{route_absolute_reads=true})
+maki.api.set_slot('fixture.check',function()
+ assert(classifications==1 and reviews==EXPECTED_REVIEWS)
+ return true
+end)
+"#;
+
+    impl Fixture {
+        fn bundled_read(&self, file: &str, offset: usize, limit: usize) -> Result<String, String> {
+            let input = json!({"path":self.dir.path().join(file),"offset":offset,"limit":limit});
+            let done = super::within(maki_agent::agent::tool_dispatch::run(
+                "bundled-read".into(),
+                "read",
+                &input,
+                &self.ctx,
+                CallOrigin::Model,
+            ));
+
+            maki_agent::tools::interpreter_bridge::flatten(&done)
+        }
+    }
+
+    #[test_case("repeat")]
+    #[test_case("path")]
+    #[test_case("offset")]
+    #[test_case("limit")]
+    #[test_case("history")]
+    #[test_case("host_policy")]
+    #[test_case("classifier_policy")]
+    #[test_case("deny")]
+    #[test_case("fresh_session")]
+    #[test_case("resumed_session")]
+    fn bundled_read_exact_grant_acceptance(change: &str) {
+        let expected_reviews = if change == "deny" { "2" } else { "3" };
+        let layer = BUNDLED_REVIEW
+            .replace(
+                "POLICY_CHANGE",
+                if change == "classifier_policy" {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
+            .replace("EXPECTED_REVIEWS", expected_reviews);
+        let mut fixture = Fixture::with_read(&layer, true);
+        fixture.ctx.config.rtk = false;
+        for name in ["first.txt", "second.txt"] {
+            std::fs::write(fixture.dir.path().join(name), BENIGN_CONTENT).unwrap();
+        }
+        assert_eq!(
+            fixture.bundled_read("first.txt", 2, 2).unwrap(),
+            SELECTED_CONTENT
+        );
+        assert_eq!(
+            fixture.bundled_read("first.txt", 2, 2).unwrap(),
+            SELECTED_CONTENT
+        );
+        let (mut file, mut offset, mut limit) = ("first.txt", 2, 2);
+        match change {
+            "repeat" | "classifier_policy" => {}
+            "path" => file = "second.txt",
+            "offset" => offset = 1,
+            "limit" => limit = 1,
+            "history" => fixture.history.push(Message {
+                human_prompt: Some("Read a different section now.".into()),
+                ..Message::user("Read a different section now.".into())
+            }),
+            "host_policy" | "deny" => fixture.ctx.permissions.add_session_rule(PermissionRule {
+                tool: ToolKey::native(if change == "deny" {
+                    "read"
+                } else {
+                    "unrelated"
+                }),
+                scope: None,
+                effect: if change == "deny" {
+                    Effect::Deny
+                } else {
+                    Effect::Allow
+                },
+            }),
+            "fresh_session" => {
+                let id = MakiId::generate();
+                fixture.ctx.session_id = Some(SessionRef::from_id(id));
+                publish_live_history(id, &fixture._mirror);
+                fixture.ctx.permissions = Arc::new(fixture.ctx.permissions.fork());
+            }
+            "resumed_session" => {
+                let serialized = serde_json::to_vec(fixture.history.as_slice()).unwrap();
+                fixture.history = History::restored(serde_json::from_slice(&serialized).unwrap())
+                    .with_mirror(Arc::clone(&fixture._mirror));
+                fixture.ctx.permissions.load_session_rules(Vec::new());
+            }
+            _ => unreachable!("unknown acceptance case"),
+        }
+        let output = fixture.bundled_read(file, offset, limit);
+        if change == "repeat" {
+            assert_eq!(output.unwrap(), SELECTED_CONTENT);
+        } else {
+            assert!(
+                output.is_err(),
+                "stale grant accepted after {change}: {output:?}"
+            );
+        }
+        assert!(fixture.call("check_observer", json!({})));
+    }
+
+    #[test]
+    fn live_history_exact_read_grant_invalidation_and_denied_reuse() {
+        let mut fixture = Fixture::new(
+            r#"
+local calls=0
+maki.api.set_slot('permission.prompt',function(prev,req,ctx)
+ calls=calls+1
+ if calls==1 or calls==5 or calls==7 then
+  assert(req.permission.classifier.exact_grant_supported)
+  return {decision='allow',classifier=true,exact_grant=true,policy_version='fixture-v1'}
+ end
+ if calls==2 then assert(req.permission.classifier.exact_grant_available) end
+ return {decision='allow',classifier=true,reuse_grant=true,policy_version='fixture-v1'}
+end,{route_absolute_reads=true})
+"#,
+        );
+        assert!(fixture.read("first.txt"));
+        assert!(fixture.read("first.txt"));
+        assert!(!fixture.read("second.txt"));
+        fixture.history.push(Message {
+            human_prompt: Some("New synthetic instruction.".into()),
+            ..Message::user("New synthetic instruction.".into())
+        });
+        assert!(!fixture.read("first.txt"));
+        assert!(
+            fixture.read("first.txt"),
+            "fresh review can store after history update"
+        );
+        fixture.ctx.permissions.add_session_rule(PermissionRule {
+            tool: ToolKey::native("unrelated"),
+            scope: None,
+            effect: Effect::Allow,
+        });
+        assert!(
+            !fixture.read("first.txt"),
+            "changed host policy cannot reuse"
+        );
+        assert!(
+            fixture.read("first.txt"),
+            "fresh review restores a live grant"
+        );
+        fixture.ctx.permissions.add_session_rule(PermissionRule {
+            tool: ToolKey::native("read"),
+            scope: None,
+            effect: Effect::Deny,
+        });
+        assert!(!fixture.read("first.txt"));
+    }
+}
+
 const PROBE_SCHEMA: &str = r#"{ type = "object", properties = {}, additionalProperties = false }"#;
 /// Generous on purpose. A bound a slow machine can trip is a bound that fails
 /// for the wrong reason, and this one is only reached when something is stuck.
@@ -624,6 +1204,32 @@ fn a_layer_pays_the_authority_of_the_call_it_filters(
 
     let expected = runs.then(|| HIJACKED.to_owned());
     assert_eq!(input(&reg, tool, COMMAND), (expected, None));
+}
+
+#[test_case(HookStage::Input; "input")]
+#[test_case(HookStage::Output; "output")]
+fn review_only_authority_cannot_delegate_generic_hooks(stage: HookStage) {
+    let (registry, host) = host();
+    let mut permissions = PluginPermissions::denied();
+    permissions.set(Permission::PermissionReviewRead, true);
+    load_granted(
+        &host,
+        LAYER_PLUGIN,
+        &layer(SLOT_TOOL, stage, "return { changed = true }"),
+        permissions,
+    );
+    let cancel = CancelToken::none();
+    let call = call_of(
+        SLOT_TOOL,
+        Authority::Capability(Permission::PermissionReviewRead),
+        CallOrigin::Model,
+        &cancel,
+    );
+
+    assert!(matches!(
+        fire_call(&registry, &call, stage, serde_json::json!({})),
+        Verdict::Unchanged
+    ));
 }
 
 #[test]

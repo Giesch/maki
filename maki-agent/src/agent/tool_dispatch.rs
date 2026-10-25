@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -370,6 +370,57 @@ struct PromptAsk<'a> {
 }
 
 impl PromptLayers for PromptAsk<'_> {
+    fn requires_human(&self) -> bool {
+        crate::permissions::fixed_guard_reason(&ToolKey::native(self.hook.tool), self.input)
+            .is_some()
+    }
+
+    fn exact_binding(&self) -> Option<Value> {
+        let session = self.hook.ctx.session_id.as_ref()?;
+        let tool = ToolKey::native(self.hook.tool);
+        if self.hook.tool != "read"
+            || crate::permissions::fixed_guard_reason(&tool, self.input).is_some()
+        {
+            return None;
+        }
+        let path = self.input.get("path").and_then(Value::as_str)?;
+        if !Path::new(path).is_absolute() {
+            return None;
+        }
+        let history = crate::agent::live_prompt_history(session.id())?;
+        let (complete, _) = crate::permissions::trusted_user_prompts(&history.messages, usize::MAX);
+        if !complete {
+            return None;
+        }
+        let cwd = std::env::current_dir().ok()?.canonicalize().ok()?;
+
+        Some(json!({
+            "session": session.as_str(),
+            "authorization_revision": format!("{}:{}", history.epoch, history.messages.len()),
+            "authorization_complete": true,
+            "tool": self.hook.tool,
+            "tool_kind": self.hook.native.as_deref().and_then(Tool::tool_kind),
+            "implementation": Arc::as_ptr(self.hook.native.as_ref()?) as *const () as usize,
+            "input": self.input,
+            "resolved_path": Path::new(path).canonicalize().ok()?,
+            "cwd": cwd,
+        }))
+    }
+
+    fn answer_with_metadata<'a>(
+        &'a self,
+        scopes: &'a [String],
+        metadata: &'a Value,
+    ) -> BoxFuture<'a, Option<LayerAnswer>> {
+        Box::pin(async move {
+            let call = self.hook.call(self.tool_id, Some(self.input));
+            self.hook
+                .installed
+                .prompt_with_metadata(self.input, scopes, metadata, &call, self.hook.ctx)
+                .await
+        })
+    }
+
     fn answer<'a>(&'a self, scopes: &'a [String]) -> BoxFuture<'a, Option<LayerAnswer>> {
         Box::pin(async move {
             let call = self.hook.call(self.tool_id, Some(self.input));
@@ -750,6 +801,9 @@ async fn run_native_tool(
     };
 
     let result = invocation.execute(ctx).await;
+    if result.output.is_ok() {
+        ctx.permissions.successful_tool_completion();
+    }
 
     // Nothing else could have touched the file while the guard was held, so the
     // mtime is refreshed here instead of by each write plugin remembering to.
@@ -915,6 +969,10 @@ async fn run_local_tool(
             (e, true)
         }
     };
+    if !is_error {
+        ctx.permissions.successful_tool_completion();
+    }
+
     ToolDoneEvent {
         call: None,
         id,
@@ -944,11 +1002,56 @@ async fn enforce_permission(
             "enforce_permission called with dotted name: {name}"
         ));
     }
+    let tool = ToolKey::native(name);
+    let guard_reason = crate::permissions::fixed_guard_reason(&tool, input);
+    let ask = ask.or(guard_reason);
+
     match (inv.permission_scopes().await, ask) {
         (Some(scopes), ask) => {
             gate(ctx, &ToolKey::native(name), &scopes, id, input, ask, hook).await
         }
-        (None, Some(_)) => gate_on_input(ctx, &ToolKey::native(name), id, input, ask, hook).await,
+        (None, Some(_)) if guard_reason.is_some() => {
+            let scope = input
+                .get("path")
+                .or_else(|| input.get("file_path"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| truncate_bytes(&input.to_string(), MCP_PERM_SCOPE_MAX_BYTES));
+            gate(
+                ctx,
+                &tool,
+                &PermissionScopes::single(scope),
+                id,
+                input,
+                ask,
+                hook,
+            )
+            .await
+        }
+        (None, Some(_)) => gate_on_input(ctx, &tool, id, input, ask, hook).await,
+        (None, None)
+            if name == "read"
+                && hook.is_some_and(|hook| hook.installed.routes_absolute_reads())
+                && input
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| Path::new(path).is_absolute()) =>
+        {
+            let scope = input
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            gate(
+                ctx,
+                &tool,
+                &PermissionScopes::single(scope.to_owned()),
+                id,
+                input,
+                crate::permissions::fixed_guard_reason(&tool, input),
+                hook,
+            )
+            .await
+        }
         (None, None) => Ok(()),
     }
 }
@@ -1071,6 +1174,10 @@ async fn execute_mcp_tool(
         Ok(text) => (text, false),
         Err(e) => (e.to_string(), true),
     };
+    if !is_error {
+        ctx.permissions.successful_tool_completion();
+    }
+
     done(
         TextOutput {
             loaded_tools,
@@ -2075,6 +2182,163 @@ mod tests {
             for firing in [input, output] {
                 assert_eq!(firing.tool_kind.as_deref(), Some(HOOK_TOOL_KIND));
             }
+        });
+    }
+
+    #[test]
+    fn actual_native_success_resets_classifier_denials() {
+        smol::block_on(async {
+            let (ctx, _hook) = hooked_ctx(build_ctx());
+            ctx.permissions.classifier_denials_for_test(Some(2));
+            dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_REWRITTEN_FROM)).await;
+            assert_eq!(ctx.permissions.classifier_denials_for_test(None), 0);
+        });
+    }
+
+    struct UngatedInvocation;
+
+    impl ToolInvocation for UngatedInvocation {
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain("read".into()))
+        }
+
+        fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
+            Box::pin(async { Ok(output_of("unused")).into() })
+        }
+    }
+
+    const GUARDED_TEST_PATH: &str = "/tmp/project/.env";
+
+    #[test_case("read", false ; "no_scope_read_cannot_bypass_guard")]
+    #[test_case("write", false ; "broad_allow_cannot_bypass_guard")]
+    #[test_case("read", true ; "human_can_allow_guarded_read")]
+    #[test_case("bash", true ; "human_can_allow_opaque_shell")]
+    fn fixed_guard_requires_human(tool: &str, human: bool) {
+        smol::block_on(async {
+            let ctx = ruled_ctx(&AgentMode::Build, ToolKey::Wildcard, Effect::Allow);
+            let (mut ctx, events) = answered(ctx, PermissionAnswer::AllowOnce);
+            if !human {
+                ctx.user_response_rx = None;
+            }
+            let input = json!({"path": GUARDED_TEST_PATH, "command": "cat .env"});
+            let result =
+                enforce_permission(&UngatedInvocation, tool, &input, &ctx, TEST_ID, None, None)
+                    .await;
+            assert_eq!(result.is_ok(), human, "{result:?}");
+            let requests = prompts(&events);
+            assert_eq!(requests.len(), usize::from(human));
+            if human {
+                assert!(requests[0].reason.is_some());
+            }
+        });
+    }
+
+    #[test_case(false ; "scoped_wildcard_allow_does_not_bypass_guard")]
+    #[test_case(true ; "path_specific_deny_wins_over_human_answer")]
+    fn fixed_guard_scoped_rules(deny: bool) {
+        smol::block_on(async {
+            let rules = vec![PermissionRule {
+                tool: if deny {
+                    ToolKey::native("read")
+                } else {
+                    ToolKey::Wildcard
+                },
+                scope: if deny {
+                    Some(GUARDED_TEST_PATH.into())
+                } else {
+                    None
+                },
+                effect: if deny { Effect::Deny } else { Effect::Allow },
+            }];
+            let (mut ctx, events) = answered(
+                rules_ctx(&AgentMode::Build, rules),
+                PermissionAnswer::AllowOnce,
+            );
+            if !deny {
+                ctx.user_response_rx = None;
+            }
+            let invocation: &dyn ToolInvocation = if deny {
+                &UngatedInvocation
+            } else {
+                &HookMockInvocation(GUARDED_TEST_PATH.into())
+            };
+            let result = enforce_permission(
+                invocation,
+                "read",
+                &json!({"path": GUARDED_TEST_PATH}),
+                &ctx,
+                TEST_ID,
+                None,
+                None,
+            )
+            .await;
+            assert!(result.is_err());
+            assert!(prompts(&events).is_empty());
+        });
+    }
+
+    #[test]
+    fn fixed_guard_preserves_explicit_deny() {
+        smol::block_on(async {
+            let (ctx, events) = answered(
+                denying_ctx(ToolKey::native("read")),
+                PermissionAnswer::AllowOnce,
+            );
+            let result = enforce_permission(
+                &UngatedInvocation,
+                "read",
+                &json!({"path": GUARDED_TEST_PATH}),
+                &ctx,
+                TEST_ID,
+                None,
+                None,
+            )
+            .await;
+            assert!(result.is_err());
+            assert!(prompts(&events).is_empty());
+        });
+    }
+
+    #[test]
+    fn literal_printf_keeps_ordinary_permission_path() {
+        smol::block_on(async {
+            const COMMAND: &str = "printf '%s\\n' 'guard observation'";
+            let (ctx, events) = answered(
+                rules_ctx(&AgentMode::Build, Vec::new()),
+                PermissionAnswer::AllowOnce,
+            );
+            let result = enforce_permission(
+                &HookMockInvocation(COMMAND.into()),
+                "bash",
+                &json!({"command": COMMAND}),
+                &ctx,
+                TEST_ID,
+                None,
+                None,
+            )
+            .await;
+            assert!(result.is_ok(), "{result:?}");
+            let requests = prompts(&events);
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].reason, None);
+            assert_eq!(requests[0].scopes, vec![COMMAND]);
+        });
+    }
+
+    #[test]
+    fn ordinary_no_scope_read_keeps_existing_behavior() {
+        smol::block_on(async {
+            let result = enforce_permission(
+                &UngatedInvocation,
+                "read",
+                &json!({"path": "/tmp/project/main.rs"}),
+                &build_ctx(),
+                TEST_ID,
+                None,
+                None,
+            )
+            .await;
+            assert!(result.is_ok(), "{result:?}");
         });
     }
 

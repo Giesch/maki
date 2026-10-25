@@ -30,7 +30,7 @@ declare maki: {
     del_autocmd: @checked (id: number) -> (),
     exec_autocmds: @checked (event: any, opts: any) -> (),
     declare_slot: @checked (name: string, default: any, opts: any) -> (any),
-    set_slot: @checked (name: string, wrapper: any) -> (),
+    set_slot: @checked (name: string, wrapper: any, opts: any) -> (any),
     get_slots: @checked () -> (any),
   },
   async: {
@@ -147,6 +147,7 @@ declare maki: {
     current: @checked () -> (string?, string?),
     read: @checked (opts: any) -> (any, string?),
     messages: @checked (opts: any) -> (any, string?),
+    user_prompts: @checked (opts: any) -> (any, string?),
     focus: @checked (id: string) -> (boolean?, string?),
     delete: @checked (id: string) -> (boolean?, string?),
     new: @checked (opts: any) -> (string?, string?),

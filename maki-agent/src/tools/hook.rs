@@ -133,4 +133,19 @@ pub trait ToolHook: Send + Sync + 'static {
         call: &'a HookCall<'a>,
         ctx: &'a ToolContext,
     ) -> BoxFuture<'a, Option<LayerAnswer>>;
+
+    fn routes_absolute_reads(&self) -> bool {
+        false
+    }
+
+    fn prompt_with_metadata<'a>(
+        &'a self,
+        input: &'a Value,
+        scopes: &'a [String],
+        _metadata: &'a Value,
+        call: &'a HookCall<'a>,
+        ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Option<LayerAnswer>> {
+        self.prompt(input, scopes, call, ctx)
+    }
 }

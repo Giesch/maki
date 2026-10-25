@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::mem;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
@@ -80,6 +81,9 @@ pub(crate) struct SlotStore {
     /// The published view of `slots`, for the one reader that cannot take the
     /// Lua state: a tool call on the agent's thread.
     layered: Arc<LayeredTools>,
+    // set_slot appends layers: opting in is sticky until that plugin is cleared.
+    // Routing stays enabled while any loaded plugin has opted in.
+    read_routers: HashSet<Arc<str>>,
 }
 
 impl SlotStore {
@@ -87,10 +91,12 @@ impl SlotStore {
         Self {
             slots: HashMap::new(),
             layered,
+            read_routers: HashSet::new(),
         }
     }
 
     pub fn clear_plugin(&mut self, plugin: &str) {
+        self.read_routers.remove(plugin);
         for entry in self.slots.values_mut() {
             entry.layers.retain(|l| l.plugin.as_ref() != plugin);
             if entry.owner.as_deref() == Some(plugin) {
@@ -122,9 +128,17 @@ impl SlotStore {
                 surfaces.insert(Arc::from(name.as_str()));
             }
         }
+        self.layered
+            .route_absolute_reads
+            .store(!self.read_routers.is_empty(), Ordering::Release);
         self.layered.stages.store(Arc::new(stages));
         self.layered.surfaces.store(Arc::new(surfaces));
     }
+}
+
+pub(crate) fn routes_reads_for(lua: &Lua, plugin: &str) -> bool {
+    lua.app_data_ref::<SlotStore>()
+        .is_some_and(|store| store.read_routers.contains(plugin))
 }
 
 type StageSets = [HashSet<Arc<str>>; HookStage::ALL.len()];
@@ -138,6 +152,7 @@ type StageSets = [HashSet<Arc<str>>; HookStage::ALL.len()];
 /// one process each answer for their own layers.
 #[derive(Default)]
 pub struct LayeredTools {
+    route_absolute_reads: AtomicBool,
     stages: ArcSwap<StageSets>,
     /// The `ui.`, `agent.` and `permission.` slots with at least one layer. The
     /// host reads this before it asks a chain anything, so a stock install draws
@@ -148,6 +163,10 @@ pub struct LayeredTools {
 }
 
 impl LayeredTools {
+    pub fn routes_absolute_reads(&self) -> bool {
+        self.route_absolute_reads.load(Ordering::Acquire)
+    }
+
     pub fn wraps(&self, tool: &str, stage: HookStage) -> bool {
         let layered = &self.stages.load()[stage as usize];
         layered.contains(tool) || layered.contains(ANY_TOOL)
@@ -589,9 +608,9 @@ fn parse_slot_capability(
     let mut priced: Vec<Permission> = Vec::new();
     for key in declared.sequence_values::<String>() {
         let key = key?;
-        let permission = Permission::from_key(&key).ok_or_else(|| {
+        let permission = Permission::from_key(&key).filter(|permission| permission.is_execution()).ok_or_else(|| {
             mlua::Error::runtime(format!(
-                "declare_slot: '{name}' prices layers at unknown permission '{key}' (valid: {})",
+                "declare_slot: '{name}' prices layers at unknown permission '{key}' or a non-execution grant (valid: {})",
                 permission_keys()
             ))
         })?;
@@ -659,23 +678,69 @@ fn parse_slot_capability(
 /// carries on, and a reload that changes what you hold takes effect on the
 /// next call.
 ///
+/// Read review without filesystem access requires `[permissions] permission_review_read = true`
+/// in `plugin.toml` (and package approval), plus `{route_absolute_reads=true}` below.
+/// Unlike execution capabilities, `permission_review_read` defaults to false even for local manifests.
+/// It authorizes only this plugin's `permission.prompt` layers for native `read` calls
+/// declaring `fs_read`. Tool input, call, and output layers still require `fs_read`.
+/// Filesystem APIs remain denied. The reviewer must restrict its own model tools and MCP access.
+/// Ordinary denies, secret guards, and forced human prompts still take precedence.
+///
 /// @param name string Slot name to wrap.
 /// @param wrapper function Layer: `function(prev, ...)`. Call `prev(...)` to continue.
-/// @return
+/// @param opts table? For `permission.prompt`, `{route_absolute_reads=true}` requires `permission_review_read` and routes otherwise-unscoped absolute native reads through permissions. Missing authority raises before registration. This never approves a call or grants reviewer filesystem access. Unloading the plugin removes its opt-in.
+/// @return (table) Registration acknowledgement `{ route_absolute_reads = boolean }`. True means this call requested and registered read routing for this plugin and the routing was published. False means this call did not request routing, even if an earlier layer still enables it. Errors raise without an acknowledgement. Older hosts return nil. Check for true before relying on routing.
 /// @example
 /// maki.api.set_slot("myplugin.render", function(prev, text)
 ///   return prev("[" .. text .. "]")
 /// end)
 #[lua_fn]
-fn set_slot(lua: &Lua, #[ctx] plugin: Arc<str>, name: String, wrapper: Function) -> LuaResult<()> {
+fn set_slot(
+    lua: &Lua,
+    #[ctx] plugin: Arc<str>,
+    #[ctx] permissions: PluginPermissions,
+    name: String,
+    wrapper: Function,
+    opts: Option<Table>,
+) -> LuaResult<Table> {
+    let route_reads = match opts
+        .as_ref()
+        .map(|opts| opts.get::<Value>("route_absolute_reads"))
+        .transpose()?
+        .unwrap_or(Value::Nil)
+    {
+        Value::Nil => false,
+        Value::Boolean(enabled) => enabled,
+        _ => {
+            return Err(mlua::Error::runtime(
+                "route_absolute_reads must be a boolean",
+            ));
+        }
+    };
+    if route_reads && name != PERMISSION_PROMPT_SLOT {
+        return Err(mlua::Error::runtime(
+            "route_absolute_reads is only valid for permission.prompt",
+        ));
+    }
+    if route_reads && !permissions.is_allowed(Permission::PermissionReviewRead) {
+        return Err(mlua::Error::runtime(
+            "route_absolute_reads requires permission_review_read",
+        ));
+    }
+    let acknowledgement = lua.create_table()?;
+    acknowledgement.set("route_absolute_reads", route_reads)?;
     let mut store = slot_store_mut(lua)?;
+    if route_reads {
+        store.read_routers.insert(Arc::clone(&plugin));
+    }
     let entry = store.slots.entry(name.clone()).or_default();
     entry.layers.push(SlotLayer {
         plugin: Arc::clone(&plugin),
         func: wrapper,
     });
     store.publish();
-    Ok(())
+
+    Ok(acknowledgement)
 }
 
 /// List all known slots and their current state. Useful for debugging
@@ -719,7 +784,7 @@ fn get_slots(lua: &Lua) -> LuaResult<Table> {
 
 lua_table! {
     extend "maki.api" => pub(crate) fn add_slot_methods(plugin: Arc<str>, permissions: PluginPermissions), DOCS [
-        declare_slot(plugin, permissions), set_slot(plugin), get_slots,
+        declare_slot(plugin, permissions), set_slot(plugin, permissions), get_slots,
     ]
 }
 

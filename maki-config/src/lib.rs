@@ -164,6 +164,7 @@ pub enum Permission {
     Run,
     Env,
     Agent,
+    PermissionReviewRead,
 }
 
 impl Permission {
@@ -189,6 +190,11 @@ impl Permission {
             .find(|p| p.manifest_key() == key)
     }
 
+    /// Whether this grant can price tool execution or a custom slot.
+    pub const fn is_execution(self) -> bool {
+        !matches!(self, Self::PermissionReviewRead)
+    }
+
     pub const fn manifest_key(self) -> &'static str {
         match self {
             Permission::FsRead => "fs_read",
@@ -197,6 +203,7 @@ impl Permission {
             Permission::Run => "run",
             Permission::Env => "env",
             Permission::Agent => "agent",
+            Permission::PermissionReviewRead => "permission_review_read",
         }
     }
 
@@ -212,6 +219,9 @@ impl Permission {
             Permission::Env => "reading the process environment, where secrets live",
             Permission::Agent => {
                 "starting model turns: prompting a chat, or running its own sessions"
+            }
+            Permission::PermissionReviewRead => {
+                "reviewing native read permission prompts with explicit read routing; no filesystem API access"
             }
         }
     }

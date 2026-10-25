@@ -28,6 +28,22 @@ pub(crate) struct SlotHook {
     pub(crate) layered: Arc<LayeredTools>,
 }
 
+fn prompt_request(
+    tool: &str,
+    tool_id: &str,
+    input: &Value,
+    scopes: &[String],
+    metadata: &Value,
+) -> Value {
+    json!({
+        "tool": tool,
+        "tool_id": tool_id,
+        "input": input,
+        "scopes": scopes,
+        "permission": metadata,
+    })
+}
+
 fn deadline_ms(deadline: Instant) -> u64 {
     deadline
         .saturating_duration_since(Instant::now())
@@ -51,6 +67,10 @@ impl SlotHook {
 }
 
 impl ToolHook for SlotHook {
+    fn routes_absolute_reads(&self) -> bool {
+        self.layered.routes_absolute_reads()
+    }
+
     fn wraps(&self, tool: &str, stage: HookStage) -> bool {
         self.layered.wraps(tool, stage)
     }
@@ -92,6 +112,17 @@ impl ToolHook for SlotHook {
         call: &'a HookCall<'a>,
         ctx: &'a ToolContext,
     ) -> BoxFuture<'a, Option<LayerAnswer>> {
+        self.prompt_with_metadata(input, scopes, &Value::Null, call, ctx)
+    }
+
+    fn prompt_with_metadata<'a>(
+        &'a self,
+        input: &'a Value,
+        scopes: &'a [String],
+        metadata: &'a Value,
+        call: &'a HookCall<'a>,
+        ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Option<LayerAnswer>> {
         Box::pin(async move {
             if !self.layered.layers_surface(PERMISSION_PROMPT_SLOT) {
                 return None;
@@ -101,12 +132,7 @@ impl ToolHook for SlotHook {
                 authority: call.authority,
                 cancel: call.cancel.clone(),
                 deadline: call.deadline,
-                req: json!({
-                    "tool": call.tool,
-                    "tool_id": call.tool_id,
-                    "input": input,
-                    "scopes": scopes,
-                }),
+                req: prompt_request(call.tool, call.tool_id, input, scopes, metadata),
                 ctx: Box::new(LuaCtx::handler(ctx)),
             };
             self.tx
@@ -145,5 +171,26 @@ impl AgentHook for SlotHook {
             }),
             may_ask: false,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prompt_request;
+    use serde_json::json;
+
+    const COVERED: &str = "git status";
+    const PENDING: &str = "cargo test";
+
+    #[test]
+    fn prompt_metadata_does_not_replace_unresolved_scopes_or_input() {
+        let input = json!({"command": "git status && cargo test"});
+        let metadata = json!({"version": 1, "all_scopes": [COVERED, PENDING]});
+        let request = prompt_request("bash", "call", &input, &[PENDING.to_owned()], &metadata);
+        assert_eq!(request["input"], input);
+        assert_eq!(request["scopes"], json!([PENDING]));
+        assert_eq!(request["permission"], metadata);
+        assert_eq!(request["tool"], "bash");
+        assert_eq!(request["tool_id"], "call");
     }
 }

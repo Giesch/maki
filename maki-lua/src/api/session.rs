@@ -3,7 +3,7 @@
 //! directly to the agent mailbox so synchronous callbacks can use it.
 
 use maki_agent::SessionMailbox;
-use maki_agent::agent::live_history;
+use maki_agent::agent::{live_history, live_prompt_history};
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::{ContentBlock, Message, Role};
 use maki_storage::id::MakiId;
@@ -27,6 +27,8 @@ const BLANK_NOTIFY_ERR: &str = "text must not be blank";
 const SESSION_REQUIRED_ERR: &str = "session is required";
 const NOT_LIVE_ERR: &str = "session not live";
 const NO_FOCUSED_ERR: &str = "no focused session";
+const MAX_PROMPT_BYTES: usize = 1024 * 1024;
+const PROMPT_BUDGET_ERR: &str = "max_bytes must be between 1 and 1048576";
 
 pub(crate) fn not_live(session: MakiId) -> String {
     format!("{NOT_LIVE_ERR}: {session}")
@@ -268,6 +270,47 @@ async fn messages(
     Ok((Some(out), None))
 }
 
+/// Reads exact trusted human text in the named live session, oldest first.
+/// Only direct TUI submissions are currently trusted; ACP, SDK, plugins,
+/// delegated inputs, summaries and legacy turns cannot establish human origin.
+/// Text is captured before input hooks rewrite it. Images are not included.
+/// `complete` must be true before using the result as authorization evidence.
+/// Compacted/replaced or legacy histories return false. A byte overflow returns
+/// no prompts, never a truncated prefix. The budget counts UTF-8 prompt bytes.
+/// `revision` is an opaque process-local snapshot token, not a durable cache key.
+/// No focused-session fallback is used, including in child tasks.
+///
+/// @param opts table `session` (string) and `max_bytes` (integer, 1..1048576), required.
+/// @return (table|nil, string|nil) `{session, complete, revision, prompts}`, or nil and an error.
+/// @example
+/// local history, err = maki.session.user_prompts({ session = id, max_bytes = 65536 })
+#[lua_fn]
+async fn user_prompts(lua: Lua, opts: Table) -> LuaResult<Pair<Value>> {
+    let session = try_pair!(required_session(Some(&opts))?);
+    let budget = opts.get::<Option<usize>>("max_bytes")?;
+    let Some(budget) = budget.filter(|n| (1..=MAX_PROMPT_BYTES).contains(n)) else {
+        return Ok(err_pair(PROMPT_BUDGET_ERR));
+    };
+
+    let Some(history) = live_prompt_history(session) else {
+        return Ok(err_pair(not_live(session)));
+    };
+
+    let (complete, prompts) = trusted_prompts(&history.messages, budget);
+    let result = json!({
+        "session": session.to_string(),
+        "complete": complete,
+        "revision": format!("{}:{}", history.epoch, history.messages.len()),
+        "prompts": prompts,
+    });
+
+    Ok((Some(json_to_lua(&lua, &result)?), None))
+}
+
+fn trusted_prompts(messages: &[Message], budget: usize) -> (bool, Vec<&str>) {
+    maki_agent::permissions::trusted_user_prompts(messages, budget)
+}
+
 /// Returns the id of the focused session. Under `maki -p` and the sdk,
 /// that is the one session they run.
 ///
@@ -456,7 +499,7 @@ lua_table! {
         may_run_agents: bool,
     ),
     DOCS [
-        list(tx), live(tx), current(tx), read(tx), messages(tx), focus(tx), delete(tx),
+        list(tx), live(tx), current(tx), read(tx), messages(tx), user_prompts(), focus(tx), delete(tx),
         new(tx, may_run_agents), prompt(perms, tx), notify(may_run_agents), set_mode(tx), set_title(tx),
     ]
 }
@@ -490,6 +533,123 @@ mod tests {
         let t = create_session_table(&lua, tx, &PluginPermissions::trusted(), true).unwrap();
         lua.globals().set("session", t).unwrap();
         lua
+    }
+
+    fn human(text: &str) -> Message {
+        Message {
+            human_prompt: Some(text.to_owned()),
+            ..Message::user(text.to_owned())
+        }
+    }
+
+    #[test]
+    fn trusted_prompt_history_resume_rewind_and_replacement() {
+        let mut history = History::new(Vec::new());
+        history.push(human(TEXT));
+        history.push(human(FOCUSED_TEXT));
+        assert_eq!(
+            trusted_prompts(history.as_slice(), MAX_PROMPT_BYTES),
+            (true, vec![TEXT, FOCUSED_TEXT])
+        );
+        let stored = serde_json::to_vec(history.as_slice()).unwrap();
+        let mut resumed = History::restored(serde_json::from_slice(&stored).unwrap());
+        assert_eq!(
+            trusted_prompts(resumed.as_slice(), MAX_PROMPT_BYTES),
+            (true, vec![TEXT, FOCUSED_TEXT])
+        );
+        resumed.truncate(1);
+        assert_eq!(
+            trusted_prompts(resumed.as_slice(), MAX_PROMPT_BYTES),
+            (true, vec![TEXT])
+        );
+        resumed.replace(vec![Message::user(TEXT.into())]);
+        assert_eq!(
+            trusted_prompts(resumed.as_slice(), MAX_PROMPT_BYTES),
+            (false, vec![])
+        );
+        resumed.push(human(FOCUSED_TEXT));
+        assert_eq!(
+            trusted_prompts(resumed.as_slice(), MAX_PROMPT_BYTES),
+            (false, vec![FOCUSED_TEXT])
+        );
+        assert_eq!(
+            trusted_prompts(history.as_slice(), TEXT.len()),
+            (false, vec![])
+        );
+    }
+
+    #[test]
+    fn trusted_prompt_history_filters_non_human_sources() {
+        let mut history = History::new(Vec::new());
+        history.push(human(TEXT));
+        history.push(Message::observation(FOCUSED_TEXT.into()));
+        history.push(Message::synthetic(FOCUSED_TEXT.into()));
+        history.push(Message {
+            role: Role::Assistant,
+            ..human(FOCUSED_TEXT)
+        });
+        assert_eq!(
+            trusted_prompts(history.as_slice(), MAX_PROMPT_BYTES),
+            (true, vec![TEXT])
+        );
+        history.push(Message::user(FOCUSED_TEXT.into()));
+        assert_eq!(
+            trusted_prompts(history.as_slice(), MAX_PROMPT_BYTES),
+            (false, vec![TEXT])
+        );
+        assert_eq!(
+            trusted_prompts(&[Message::user(TEXT.into())], MAX_PROMPT_BYTES),
+            (false, vec![])
+        );
+    }
+
+    #[test]
+    fn user_prompts_reads_only_named_live_session() {
+        let id = MakiId::generate();
+        let other = MakiId::generate();
+        let mirror = Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(Vec::new())));
+        let mut history = History::new(Vec::new()).with_mirror(Arc::clone(&mirror));
+        history.push(human(TEXT));
+        publish_live_history(id, &mirror);
+        let lua = lua_with_session(None);
+        let code = format!("return session.user_prompts({{session='{id}',max_bytes=1024}})");
+        let (value, error): (Table, Option<String>) =
+            smol::block_on(lua.load(&code).eval_async()).unwrap();
+        assert_eq!(error, None);
+        assert_eq!(value.get::<String>("session").unwrap(), id.to_string());
+        assert!(value.get::<bool>("complete").unwrap());
+        assert_eq!(
+            value
+                .get::<Table>("prompts")
+                .unwrap()
+                .get::<String>(1)
+                .unwrap(),
+            TEXT
+        );
+        let revision = value.get::<String>("revision").unwrap();
+        history.truncate(0);
+        let (value, _): (Table, Option<String>) =
+            smol::block_on(lua.load(&code).eval_async()).unwrap();
+        assert!(!value.get::<bool>("complete").unwrap());
+        assert_ne!(value.get::<String>("revision").unwrap(), revision);
+        let code = format!("return session.user_prompts({{session='{other}',max_bytes=1024}})");
+        let (value, error): (Value, Option<String>) =
+            smol::block_on(lua.load(&code).eval_async()).unwrap();
+        assert!(value.is_nil());
+        assert_eq!(error, Some(not_live(other)));
+    }
+
+    #[test_case("return session.user_prompts({max_bytes=1024})", SESSION_REQUIRED_ERR; "missing_session")]
+    #[test_case("return session.user_prompts({session='%ID%'})", PROMPT_BUDGET_ERR; "missing_budget")]
+    #[test_case("return session.user_prompts({session='%ID%',max_bytes=0})", PROMPT_BUDGET_ERR; "zero_budget")]
+    #[test_case("return session.user_prompts({session='%ID%',max_bytes=1048577})", PROMPT_BUDGET_ERR; "over_host_limit")]
+    fn user_prompts_runtime_errors_are_pairs(code: &str, expected: &str) {
+        let lua = lua_with_session(None);
+        let code = code.replace("%ID%", &MakiId::generate().to_string());
+        let (value, error): (Value, Option<String>) =
+            smol::block_on(lua.load(&code).eval_async()).unwrap();
+        assert!(value.is_nil());
+        assert_eq!(error.as_deref(), Some(expected));
     }
 
     #[test]
