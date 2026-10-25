@@ -827,6 +827,7 @@ mod tests {
                     data: SIGNATURE.into(),
                 },
             ],
+            ..Default::default()
         };
         assert_eq!(
             message_json(&message),
