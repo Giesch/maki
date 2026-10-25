@@ -49,7 +49,7 @@ const RTK_FIXTURE_DIR: &str = "MAKI_TEST_RTK_DIR";
 #[cfg(unix)]
 const RTK_LOG: &str = "MAKI_TEST_RTK_LOG";
 #[cfg(unix)]
-const RTK_COMMAND: &str = "printf original";
+const RTK_COMMAND: &str = "printf '%s\\n' 'original'";
 const RELAY: &str = r#"
 maki.api.register_tool({
     name = "relay_read",
@@ -489,25 +489,18 @@ fn programmatic_bash_skips_automatic_rtk_rewriting() {
         ctx.config.rtk = true;
         assert_eq!(
             run(&ctx, "bash", json!({ "command": RTK_COMMAND })).unwrap(),
-            "rewritten"
+            "original"
         );
         let log_path = Path::new(&dir).join("calls.txt");
-        let before = fs::read_to_string(&log_path).unwrap();
-        assert!(before.contains("--version"));
-        assert!(before.contains("rewrite"));
+        assert!(!log_path.exists(), "reviewed Bash must not invoke RTK");
         assert_eq!(
             python(&ctx, &format!("print(await bash(command={RTK_COMMAND:?}))"))
                 .unwrap()
                 .trim(),
             "original"
         );
-        assert_eq!(fs::read_to_string(&log_path).unwrap(), before);
-        assert_eq!(
-            python(&ctx, "print(await bash(command='rtk emit'))")
-                .unwrap()
-                .trim(),
-            "explicit"
-        );
+        assert!(!log_path.exists(), "programmatic Bash must not invoke RTK");
+
         return;
     }
     let dir = tempfile::tempdir().unwrap();

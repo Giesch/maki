@@ -1487,7 +1487,7 @@ pub struct AgentConfig {
 
     #[config(
         default = true,
-        desc = "Rewrite the model's bash commands with [rtk](https://github.com/rtk-ai/rtk) when it is installed"
+        desc = "Retained for compatibility. Bundled Bash does not automatically rewrite commands with [rtk](https://github.com/rtk-ai/rtk)"
     )]
     pub rtk: bool,
 
