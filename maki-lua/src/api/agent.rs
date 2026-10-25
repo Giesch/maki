@@ -567,9 +567,10 @@ async fn callable_tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<P
 /// @param opts table? Optional fields:
 ///   `timeout` (integer?) - deadline in seconds.
 ///   `output_mode` (string?) - "full" (default) returns the complete text.
-///     "compact" returns what the model would get, with output limits and
-///     RTK rewriting. Permissions and hooks apply in both modes, and hooks
-///     see the mode as `ctx.output_mode`.
+///     "compact" returns what the model would get, with output limits.
+///     Bundled Bash does not automatically rewrite commands with RTK in either mode.
+///     Permissions and hooks apply in both modes, and hooks see the mode as
+///     `ctx.output_mode`.
 ///   `on_live_buf` (function?) - called with a `BufHandle` for each live buffer
 ///     the tool publishes. Must not yield.
 ///   `on_annotation` (function?) - called with an annotation string for each
