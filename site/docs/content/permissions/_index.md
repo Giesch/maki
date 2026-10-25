@@ -201,9 +201,76 @@ When you pick "always allow" (or always deny for MCP), the saved scope is genera
 
 For MCP tools, both allow and deny decisions generalize to `*` (the entire tool). MCP inputs are opaque JSON with no meaningful scope pattern. Denying a single MCP invocation denies that tool until you revoke the rule.
 
+## Fixed human-review guards
+
+Fixed guards run before permission plugins, allow rules, and YOLO. A guarded
+request needs a human answer. Unattended requests are denied.
+
+For native `read`, `write`, `edit`, and `multiedit`, Maki checks both the supplied
+path and the resolved target. Matching is case-insensitive on path components:
+
+- Directories: `.ssh`, `.aws`, `.gnupg`, `.azure`, `.kube`.
+- Names: `.netrc`, `.npmrc`, `.pypirc`, `credentials`, `credentials.json`,
+  `id_rsa`, `id_ed25519`.
+- Patterns: `.env`, `.env.*`, `*.pem`, `*.key`.
+
+A missing or unresolved target also needs human approval. These are known path
+patterns, not content scanning. Search, glob, network, MCP, and other plugin tools
+are outside these file guards.
+
+The Bash guard lets the exact shape `printf '%s\n' 'TEXT'` and a restricted
+Cargo grammar continue to ordinary rules or classifier review. `TEXT` cannot
+contain a single quote or control characters. Passing the guard does not approve
+the call or prove transitive effects safe.
+
+Supported Cargo actions are `build`, `check`, `test`, and `clippy`. Every token
+must match the following grammar:
+
+- Flags: `--offline`, `--locked`, `--frozen`, `--release`, `--workspace`,
+  `--all-targets`, `--all-features`, `--no-default-features`, `--lib`, `--bins`,
+  `--tests`, `--benches`, `--examples`, `--quiet`, `-q`, `--verbose`, `-v`.
+- `-p`, `--package`, `--bin`, `--test`, `--bench`, or `--example`, followed by
+  an identifier containing ASCII letters, digits, `_`, or `-`, not starting with `-`.
+- `--features` followed by comma-separated identifiers.
+- `-j` or `--jobs` followed by an integer from 1 through 65535.
+- For `cargo test`, at most one filter containing identifiers separated by `::`.
+
+Only literal spaces separate tokens. Quotes, escapes, expansions, assignments,
+operators, wrappers, unknown flags, config/path/output overrides, and forwarded
+arguments such as `--` need human approval, even under allow rules or YOLO.
+The cwd must be the process cwd or an explicit absolute workdir. Both lexical
+and resolved paths must pass the file guards, resolve to an existing directory,
+and contain `Cargo.toml`. Build scripts, dependencies, environment, and test code
+remain contextual review inputs. This guard provides no sandbox or proof of all
+transitive effects. The scope parser below remains a separate check.
+
+Bundled Bash no longer performs automatic RTK rewriting for any call. This keeps
+the reviewed command unchanged. `config.rtk` no longer triggers that rewrite,
+including outside classifier review, so workflows relying on automatic output
+compression change. The generated configuration reference retains `rtk` as a
+compatibility bool with default `true` and documents that no rewrite occurs.
+The run API reference states that neither output mode automatically rewrites
+commands with RTK. Configuration compatibility does not preserve automatic
+compression behavior. Explicit RTK commands are outside the supported Cargo
+grammar. Live RTK workflow compatibility and token savings remain unmeasured.
+
+### Classifier answers
+
+A permission plugin may return separate classifier answers. Explicit denies and
+fixed guards retain their authority. Consecutive classifier denials reach the
+human at the configured limit. A successful tool completion, classifier allow,
+or human answer resets the counter. Relevant policy changes invalidate grants.
+
+Classifier session grants are exact, volatile native-read approvals. They require
+an absolute path and complete live authorization history. The binding includes
+the full input, resolved target, native implementation, cwd, session, history
+revision, permission policy, and classifier policy version. Changes invalidate
+reuse. Grants do not create permission files and are not generalized to paths or
+Bash commands. Ordinary human session and persistent answers remain separate.
+
 ## YOLO Mode
 
-To skip prompts on gated tools, toggle YOLO with `/yolo`, or run with `--yolo`. Explicit deny rules still apply. The status bar shows `[yolo]` while it is on, and `/yolo` is stored with the session, so a resume comes back the same way. `--yolo` only sets the starting value for sessions you never toggled. Tools that never declare permission scopes are unaffected (they never prompted).
+To skip prompts on unguarded gated tools, toggle YOLO with `/yolo`, or run with `--yolo`. Explicit deny rules and fixed human-review guards still apply. The status bar shows `[yolo]` while it is on, and `/yolo` is stored with the session, so a resume comes back the same way. `--yolo` only sets the starting value for sessions you never toggled. Tools that never declare permission scopes are unaffected (they never prompted).
 
 To start in YOLO mode every time:
 
