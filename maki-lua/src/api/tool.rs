@@ -1493,6 +1493,7 @@ fn parse_start_annotation(spec: &Table, schema: &Value) -> LuaResult<Option<Star
 pub(crate) fn permission_keys() -> String {
     Permission::ALL
         .iter()
+        .filter(|permission| permission.is_execution())
         .map(|p| p.manifest_key())
         .collect::<Vec<_>>()
         .join(", ")
@@ -1510,12 +1511,14 @@ fn parse_tool_permission(
     let declared = spec
         .get::<Option<String>>("permission")?
         .map(|key| {
-            Permission::from_key(&key).ok_or_else(|| {
-                mlua::Error::runtime(format!(
-                    "register_tool: '{tool}' declares unknown permission '{key}' (valid: {})",
-                    permission_keys()
-                ))
-            })
+            Permission::from_key(&key)
+                .filter(|permission| permission.is_execution())
+                .ok_or_else(|| {
+                    mlua::Error::runtime(format!(
+                        "register_tool: '{tool}' declares unknown permission '{key}' or a non-execution grant (valid: {})",
+                        permission_keys()
+                    ))
+                })
         })
         .transpose()?;
     let scopes = spec.get::<LuaValue>("permission_scopes")?;

@@ -1,13 +1,16 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use maki_config::{
     DefaultEffect, Effect, FILE_WRITE_TOOLS, PermissionRule, PermissionTarget, PermissionsConfig,
     ProjectConfig, ToolKey, append_permission_rule,
 };
+use maki_providers::{Message, Role};
 use maki_storage::id::SessionRef;
+use serde_json::{Value, json};
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -29,6 +32,220 @@ pub const DECISION_SOURCE_USER_SESSION: &str = "user_session";
 pub const DECISION_SOURCE_USER_ALWAYS: &str = "user_always";
 pub const DECISION_SOURCE_USER_ABORT: &str = "user_abort";
 pub const DECISION_SOURCE_PLUGIN: &str = "plugin";
+
+/// Selects complete, visible human authorization text without accepting summaries.
+pub fn trusted_user_prompts(messages: &[Message], budget: usize) -> (bool, Vec<&str>) {
+    let mut complete = messages
+        .first()
+        .is_some_and(|message| message.prompt_history_start);
+    let mut prompts = Vec::new();
+    let mut bytes = 0usize;
+    for message in messages {
+        let excluded = !matches!(message.role, Role::User)
+            || message.is_from_host()
+            || message.display_text.as_deref() == Some("");
+        if excluded {
+            continue;
+        }
+        if let Some(text) = message.human_prompt.as_deref() {
+            bytes = bytes.saturating_add(text.len());
+            if bytes > budget {
+                return (false, Vec::new());
+            }
+            prompts.push(text);
+        } else if message.user_text().is_some() {
+            complete = false;
+        }
+    }
+
+    (complete, prompts)
+}
+
+const PROMPT_POLICY_MAX_BYTES: usize = 64 * 1024;
+const GUARDED_FILE_REASON: &str =
+    "This file may contain credentials or private keys. Human approval is required.";
+const UNKNOWN_FILE_REASON: &str =
+    "The file target cannot be determined safely. Human approval is required.";
+const OPAQUE_SHELL_REASON: &str =
+    "Shell effects and destinations are not resolved by fixed guards. Human approval is required.";
+const GUARDED_FILE_TOOLS: &[&str] = &["read", "write", "edit", "multiedit"];
+const GUARDED_COMPONENTS: &[&str] = &[".ssh", ".aws", ".gnupg", ".azure", ".kube"];
+const GUARDED_FILENAMES: &[&str] = &[
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    "credentials",
+    "credentials.json",
+    "id_rsa",
+    "id_ed25519",
+];
+
+/// Fixed guards cover dedicated file targets and conservatively escalate opaque
+/// shell calls. Search, network, MCP, and other plugin tools are not covered.
+pub(crate) fn fixed_guard_reason(tool: &ToolKey, input: &Value) -> Option<&'static str> {
+    let ToolKey::Native(name) = tool else {
+        return None;
+    };
+    if name.as_ref() == BASH_TOOL {
+        let literal_printf = input
+            .get("command")
+            .and_then(Value::as_str)
+            .and_then(|command| command.strip_prefix("printf '%s\\n' '"))
+            .and_then(|argument| argument.strip_suffix('\''))
+            .is_some_and(|argument| {
+                !argument.contains('\'') && !argument.chars().any(char::is_control)
+            });
+
+        return (!(literal_printf || bounded_project_command(input)))
+            .then_some(OPAQUE_SHELL_REASON);
+    }
+
+    if !GUARDED_FILE_TOOLS.contains(&name.as_ref()) {
+        return None;
+    }
+
+    let path = match input
+        .get("path")
+        .or_else(|| input.get("file_path"))
+        .and_then(Value::as_str)
+    {
+        Some(path) if !path.is_empty() && !path.contains('\0') => path,
+        _ => return Some(UNKNOWN_FILE_REASON),
+    };
+    let target = Path::new(path);
+    let expanded = maki_storage::paths::expand_tilde(target);
+    let absolute = match std::path::absolute(expanded) {
+        Ok(absolute) => absolute,
+        Err(_) => return Some(UNKNOWN_FILE_REASON),
+    };
+    let resolved = match maki_storage::paths::incremental_canonicalize(&absolute) {
+        Some(resolved) => resolved,
+        None => return Some(UNKNOWN_FILE_REASON),
+    };
+    let guarded = [target, resolved.as_path()].iter().any(|path| {
+        path.components().any(|component| {
+            let Component::Normal(component) = component else {
+                return false;
+            };
+            let component = component.to_string_lossy().to_ascii_lowercase();
+
+            GUARDED_COMPONENTS.contains(&component.as_str())
+                || GUARDED_FILENAMES.contains(&component.as_str())
+                || component == ".env"
+                || component.starts_with(".env.")
+                || component.ends_with(".pem")
+                || component.ends_with(".key")
+        })
+    });
+
+    guarded.then_some(GUARDED_FILE_REASON)
+}
+
+/// Recognizes literal project commands, not their transitive effects. Build scripts,
+/// dependencies, inherited environment and test code remain contextual review inputs.
+fn bounded_project_command(input: &Value) -> bool {
+    let Some(command) = input.get("command").and_then(Value::as_str) else {
+        return false;
+    };
+    // This grammar has no quoting, escapes, expansions, assignments or shell operators.
+    let literal = !command.is_empty()
+        && command
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b" -_.,:".contains(&byte));
+    if !literal {
+        return false;
+    }
+
+    let mut words = command.split(' ').filter(|word| !word.is_empty());
+    if words.next() != Some("cargo") {
+        return false;
+    }
+    let Some(action @ ("build" | "check" | "test" | "clippy")) = words.next() else {
+        return false;
+    };
+    let identifier = |word: &str| {
+        !word.is_empty()
+            && !word.starts_with('-')
+            && word
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+    };
+    let mut test_filter = false;
+    while let Some(word) = words.next() {
+        match word {
+            "--offline"
+            | "--locked"
+            | "--frozen"
+            | "--release"
+            | "--workspace"
+            | "--all-targets"
+            | "--all-features"
+            | "--no-default-features"
+            | "--lib"
+            | "--bins"
+            | "--tests"
+            | "--benches"
+            | "--examples"
+            | "--quiet"
+            | "-q"
+            | "--verbose"
+            | "-v" => {}
+            "-p" | "--package" | "--bin" | "--test" | "--bench" | "--example" => {
+                if !words.next().is_some_and(identifier) {
+                    return false;
+                }
+            }
+            "--features" => {
+                if !words
+                    .next()
+                    .is_some_and(|value| value.split(',').all(identifier))
+                {
+                    return false;
+                }
+            }
+            "-j" | "--jobs" => {
+                if !words
+                    .next()
+                    .is_some_and(|value| value.parse::<u16>().is_ok_and(|jobs| jobs > 0))
+                {
+                    return false;
+                }
+            }
+            value if action == "test" && !test_filter && value.split("::").all(identifier) => {
+                test_filter = true;
+            }
+            _ => return false,
+        }
+    }
+
+    let cwd = match input.get("workdir") {
+        None | Some(Value::Null) => std::env::current_dir().ok(),
+        Some(Value::String(path)) if Path::new(path).is_absolute() => Some(PathBuf::from(path)),
+        _ => None,
+    };
+    let Some(raw_cwd) = cwd.as_ref().and_then(|cwd| cwd.to_str()) else {
+        return false;
+    };
+    let guarded_raw_cwd =
+        fixed_guard_reason(&ToolKey::native("read"), &json!({"path": raw_cwd})).is_some();
+    if guarded_raw_cwd {
+        return false;
+    }
+
+    let Some(cwd) = cwd
+        .filter(|cwd| cwd.is_dir())
+        .and_then(|cwd| cwd.canonicalize().ok())
+    else {
+        return false;
+    };
+    let Some(canonical_cwd) = cwd.to_str() else {
+        return false;
+    };
+    let target = json!({"path": canonical_cwd});
+    let guarded_cwd = fixed_guard_reason(&ToolKey::native("read"), &target).is_some();
+
+    !guarded_cwd && cwd.join("Cargo.toml").is_file()
+}
 
 const TASK_TOOL: &str = "task";
 const BASH_TOOL: &str = "bash";
@@ -304,8 +521,20 @@ impl TaggedAnswer {
 /// a later `git push --force` it never got to see.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LayerVerdict {
+    ClassifierAllow {
+        policy_version: String,
+        grant: bool,
+        reuse: bool,
+        denial_limit: usize,
+    },
+    ClassifierDeny {
+        guidance: Option<String>,
+        denial_limit: usize,
+    },
     Allow,
-    Deny { guidance: Option<String> },
+    Deny {
+        guidance: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,6 +547,22 @@ pub struct LayerAnswer {
 /// call to the prompt.
 pub trait PromptLayers: Sync {
     fn answer<'a>(&'a self, scopes: &'a [String]) -> BoxFuture<'a, Option<LayerAnswer>>;
+
+    fn exact_binding(&self) -> Option<Value> {
+        None
+    }
+
+    fn requires_human(&self) -> bool {
+        false
+    }
+
+    fn answer_with_metadata<'a>(
+        &'a self,
+        scopes: &'a [String],
+        _metadata: &'a Value,
+    ) -> BoxFuture<'a, Option<LayerAnswer>> {
+        self.answer(scopes)
+    }
 }
 
 /// Permission rules declared by Lua plugins via
@@ -325,7 +570,7 @@ pub trait PromptLayers: Sync {
 /// the Lua runtime (writer, on plugin load/unload) and every
 /// [`PermissionManager`] (reader).
 #[derive(Default)]
-pub struct PluginRuleStore(Mutex<HashMap<Arc<str>, Vec<PermissionRule>>>);
+pub struct PluginRuleStore(Mutex<HashMap<Arc<str>, Vec<PermissionRule>>>, AtomicU64);
 
 impl PluginRuleStore {
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Arc<str>, Vec<PermissionRule>>> {
@@ -338,6 +583,7 @@ impl PluginRuleStore {
     /// An empty `rules` removes the entry, so a reload that registers
     /// nothing clears the stale rules.
     pub fn replace(&self, plugin: &str, rules: Vec<PermissionRule>) {
+        self.1.fetch_add(1, Ordering::SeqCst);
         let mut map = self.lock();
         if rules.is_empty() {
             map.remove(plugin);
@@ -347,6 +593,7 @@ impl PluginRuleStore {
     }
 
     pub fn remove(&self, plugin: &str) {
+        self.1.fetch_add(1, Ordering::SeqCst);
         self.lock().remove(plugin);
     }
 
@@ -355,7 +602,20 @@ impl PluginRuleStore {
     }
 }
 
+const CLASSIFIER_GRANT_CAP: usize = 64;
+const CLASSIFIER_GRANT_TTL: Duration = Duration::from_secs(300);
+const DEFAULT_CLASSIFIER_DENIAL_LIMIT: usize = 3;
+
+#[derive(Default)]
+struct ClassifierState {
+    denials: usize,
+    grants: Vec<(Value, Instant)>,
+}
+
 pub struct PermissionManager {
+    policy_generation: AtomicU64,
+    classifier: Mutex<ClassifierState>,
+    classifier_denial_limit: Mutex<usize>,
     session_rules: Mutex<Vec<PermissionRule>>,
     config_rules: Vec<PermissionRule>,
     builtin_rules: Vec<PermissionRule>,
@@ -374,6 +634,54 @@ pub struct PermissionManager {
 }
 
 impl PermissionManager {
+    pub fn set_classifier_denial_limit(&self, limit: usize) {
+        *self
+            .classifier_denial_limit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = limit.clamp(1, 100);
+    }
+
+    /// Outcomes are linearized by this mutex in host-observed completion order.
+    pub fn successful_tool_completion(&self) {
+        self.reset_classifier_denials();
+    }
+
+    fn reset_classifier_denials(&self) {
+        self.classifier
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .denials = 0;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn classifier_denials_for_test(&self, count: Option<usize>) -> usize {
+        let mut state = self.classifier.lock().unwrap();
+        if let Some(count) = count {
+            state.denials = count;
+        }
+
+        state.denials
+    }
+
+    fn classifier_key(
+        &self,
+        tool: &ToolKey,
+        scopes: &PermissionScopes,
+        plan_path: Option<&Path>,
+        layers: &dyn PromptLayers,
+    ) -> Option<Value> {
+        let binding = layers.exact_binding()?;
+        let metadata = self.prompt_metadata(tool, scopes);
+        if metadata["policy"]["complete"] != true {
+            return None;
+        }
+
+        let key = json!({"binding": binding, "metadata": metadata, "plan_path": plan_path, "plugin_generation": self.plugin_rules.1.load(Ordering::SeqCst), "policy_generation": self.policy_generation.load(Ordering::SeqCst)});
+        let bounded = key.to_string().len() <= PROMPT_POLICY_MAX_BYTES;
+
+        bounded.then_some(key)
+    }
+
     pub fn new(
         config: PermissionsConfig,
         cwd: PathBuf,
@@ -407,6 +715,9 @@ impl PermissionManager {
         }
 
         Self {
+            policy_generation: AtomicU64::new(0),
+            classifier: Mutex::default(),
+            classifier_denial_limit: Mutex::new(DEFAULT_CLASSIFIER_DENIAL_LIMIT),
             builtin_rules,
             session_rules: Mutex::new(Vec::new()),
             config_rules,
@@ -426,6 +737,14 @@ impl PermissionManager {
     /// restoring one session never clobbers another's grants.
     pub fn fork(&self) -> Self {
         Self {
+            policy_generation: AtomicU64::new(0),
+            classifier: Mutex::default(),
+            classifier_denial_limit: Mutex::new(
+                *self
+                    .classifier_denial_limit
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            ),
             session_rules: Mutex::new(Vec::new()),
             config_rules: self.config_rules.clone(),
             builtin_rules: self.builtin_rules.clone(),
@@ -583,7 +902,17 @@ impl PermissionManager {
         self.check_inner(tool, scopes, force_prompt, plan_path)
     }
 
+    fn invalidate_classifier_grants(&self) {
+        self.policy_generation.fetch_add(1, Ordering::SeqCst);
+        self.classifier
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .grants
+            .clear();
+    }
+
     pub fn add_session_rule(&self, rule: PermissionRule) {
+        self.invalidate_classifier_grants();
         let mut rules = self.session_rules();
         let exists = rules
             .iter()
@@ -596,6 +925,7 @@ impl PermissionManager {
     /// The explicit toggle, so it also claims the session's intent: `/yolo` off
     /// under `--yolo` genuinely turns the session off and is remembered.
     pub fn toggle_yolo(&self) -> bool {
+        self.invalidate_classifier_grants();
         let enabled = !self.yolo.fetch_xor(true, Ordering::Relaxed);
         self.yolo_explicit.store(true, Ordering::Relaxed);
         enabled
@@ -605,6 +935,7 @@ impl PermissionManager {
     /// stored intent, `None` means they never expressed one and the seed
     /// applies again.
     pub fn set_session_yolo(&self, stored: Option<bool>) {
+        self.invalidate_classifier_grants();
         self.yolo
             .store(stored.unwrap_or(self.seed_yolo), Ordering::Relaxed);
         self.yolo_explicit
@@ -642,6 +973,8 @@ impl PermissionManager {
     }
 
     pub fn load_session_rules(&self, rules: Vec<PermissionRule>) {
+        self.invalidate_classifier_grants();
+        *self.classifier.lock().unwrap_or_else(|e| e.into_inner()) = ClassifierState::default();
         *self.session_rules() = rules;
     }
 
@@ -744,6 +1077,93 @@ impl PermissionManager {
         }
     }
 
+    fn prompt_metadata(&self, tool: &ToolKey, scopes: &PermissionScopes) -> Value {
+        let rule_value = |origin: &str, rule: &PermissionRule| {
+            json!({
+                "origin": origin,
+                "tool": rule.tool.to_string(),
+                "scope": rule.scope,
+                "effect": match rule.effect { Effect::Allow => "allow", Effect::Deny => "deny" },
+            })
+        };
+        let session = self.session_rules();
+        let plugin = self.plugin_rules.snapshot();
+        let rules: Vec<Value> = session
+            .iter()
+            .map(|r| rule_value(ORIGIN_SESSION, r))
+            .chain(
+                self.config_rules
+                    .iter()
+                    .map(|r| rule_value(ORIGIN_CONFIG, r)),
+            )
+            .chain(
+                self.builtin_rules
+                    .iter()
+                    .map(|r| rule_value(ORIGIN_BUILTIN, r)),
+            )
+            .chain(plugin.iter().map(|r| rule_value(ORIGIN_PLUGIN, r)))
+            .collect();
+        let default_name = |effect| match effect {
+            DefaultEffect::Allow => "allow",
+            DefaultEffect::Deny => "deny",
+            DefaultEffect::Prompt => "prompt",
+        };
+        let mut tool_defaults: Vec<Value> = self
+            .tool_defaults
+            .iter()
+            .map(
+                |(tool, effect)| json!({"tool": tool.to_string(), "effect": default_name(*effect)}),
+            )
+            .collect();
+        tool_defaults.sort_by_key(|value| value["tool"].as_str().unwrap_or_default().to_owned());
+        let mut policy = json!({
+            "complete": true,
+            "rules": rules,
+            "default": default_name(self.default),
+            "tool_defaults": tool_defaults,
+            "yolo": self.is_yolo(),
+        });
+        let policy_too_large = policy.to_string().len() > PROMPT_POLICY_MAX_BYTES;
+        if policy_too_large {
+            policy = json!({"complete": false, "reason": "policy_size_limit"});
+        }
+        let shell = matches!(tool, ToolKey::Native(name) if name.as_ref() == BASH_TOOL);
+        let candidates: Vec<Value> = scopes
+            .scopes
+            .iter()
+            .map(|scope| {
+                json!({
+                    "tool": tool.to_string(), "scope": scope, "effect": "allow",
+                })
+            })
+            .collect();
+
+        json!({
+            "version": 1,
+            "fixed_guards": {
+                "file_tools": GUARDED_FILE_TOOLS,
+                "file_checks": "known_secret_path_patterns_and_resolved_target",
+                "shell": "bounded_literal_cargo_project_commands_or_literal_printf_otherwise_human",
+                "shell_execution": "contextual_not_sandboxed_no_post_review_rtk_rewrite",
+                "bypassed_classes": ["search", "network", "mcp", "other_plugins"],
+                "classifier_grants": "absolute_read_with_complete_live_history_only",
+            },
+            "all_scopes": scopes.scopes,
+            "force_prompt": scopes.force_prompt,
+            "policy": policy,
+            "subjects": scopes.scopes,
+            "subject_kind": if shell { "shell_scope" } else { "permission_scope" },
+            "subjects_resolved": false,
+            "candidate_rules": candidates,
+            "candidate_kind": "exact_scope",
+            "limitations": if shell {
+                vec!["Shell scopes are opaque permission strings, not resolved file or network targets. Exact-scope candidates use host prefix matching and are not exact-call grants."]
+            } else {
+                vec!["Permission scopes are tool-supplied strings, not independently resolved effects. Exact-scope candidates use host prefix matching and are not exact-call grants."]
+            },
+        })
+    }
+
     /// `ask` is a plugin's reason to show this call to the user whatever the
     /// rules say. See [`Self::check_escalated`]. `layers` may answer in the
     /// user's place before the prompt opens, and the plugin that allowed the
@@ -812,18 +1232,131 @@ impl PermissionManager {
         // An escalated call skips the layers. Another plugin's `tool.*.input`
         // sent it to a human on purpose, and under yolo these are the only
         // calls that get this far. Nothing is recorded, see `LayerVerdict`.
+        let mut metadata = self.prompt_metadata(tool, scopes);
+        let key = layers.and_then(|layers| self.classifier_key(tool, scopes, plan_path, layers));
+        let limit = *self
+            .classifier_denial_limit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let threshold_reached = {
+            let mut state = self.classifier.lock().unwrap_or_else(|e| e.into_inner());
+            state.grants.retain(|(stored, created)| {
+                created.elapsed() < CLASSIFIER_GRANT_TTL
+                    && key.as_ref().is_some_and(|key| {
+                        stored["binding"]["session"] == key["binding"]["session"]
+                            && stored["binding"]["authorization_revision"]
+                                == key["binding"]["authorization_revision"]
+                            && stored["metadata"] == key["metadata"]
+                            && stored["plugin_generation"] == key["plugin_generation"]
+                    })
+            });
+            let available = key.as_ref().and_then(|key| {
+                state.grants.iter().find(|(stored, _)| {
+                    let mut host = stored.clone();
+                    host.as_object_mut()
+                        .map(|object| object.remove("classifier_policy"));
+                    &host == key
+                })
+            });
+            metadata["classifier"] = json!({"version": 1, "denial_limit": limit, "consecutive_denials": state.denials, "exact_grant_available": available.is_some(), "grant_policy_version": available.map(|(stored, _)| &stored["classifier_policy"]), "exact_grant_supported": key.is_some()});
+            state.denials >= limit
+        };
         if ask.is_none()
+            && !threshold_reached
             && let Some(layers) = layers
-            && let Ok(Some(LayerAnswer { plugin, verdict })) = cancel.race(layers.answer(&ps)).await
+            && let Ok(Some(LayerAnswer { plugin, verdict })) = cancel
+                .race(layers.answer_with_metadata(&ps, &metadata))
+                .await
         {
-            return match verdict {
-                LayerVerdict::Allow => allowed(DECISION_SOURCE_PLUGIN).map(|_| Some(plugin)),
-                LayerVerdict::Deny { guidance } => Err(deny(
-                    DECISION_SOURCE_PLUGIN,
-                    PLUGIN_DENIED_REASON.to_owned(),
+            match verdict {
+                LayerVerdict::ClassifierAllow {
+                    policy_version,
+                    grant,
+                    reuse,
+                    denial_limit,
+                } => {
+                    if layers.requires_human() {
+                        return Err(deny(
+                            DECISION_SOURCE_RULE,
+                            "Fixed guard changed during review; retry for human approval."
+                                .to_owned(),
+                            None,
+                            None,
+                        ));
+                    }
+                    self.set_classifier_denial_limit(denial_limit);
+                    if let PermissionCheck::Denied(reason) =
+                        check(tool, &scope_refs, scopes.force_prompt)
+                    {
+                        return Err(deny(DECISION_SOURCE_RULE, reason, None, None));
+                    }
+                    let fresh = self.classifier_key(tool, scopes, plan_path, layers);
+                    let valid = key.is_some()
+                        && key == fresh
+                        && !policy_version.is_empty()
+                        && policy_version.len() <= 128
+                        && !policy_version.chars().any(char::is_control);
+                    let key = key.map(|mut key| {
+                        key["classifier_policy"] = json!(policy_version);
+                        key
+                    });
+                    let mut state = self.classifier.lock().unwrap_or_else(|e| e.into_inner());
+                    let hit = valid
+                        && state.grants.iter().any(|(stored, created)| {
+                            created.elapsed() < CLASSIFIER_GRANT_TTL && Some(stored) == key.as_ref()
+                        });
+                    if !reuse || hit {
+                        if grant && valid {
+                            if state.grants.len() >= CLASSIFIER_GRANT_CAP {
+                                state.grants.remove(0);
+                            }
+                            if let Some(key) = key {
+                                state.grants.push((key, Instant::now()));
+                            }
+                        }
+                        return allowed(DECISION_SOURCE_PLUGIN).map(|_| Some(plugin));
+                    }
+                }
+                LayerVerdict::ClassifierDeny {
                     guidance,
-                    Some(plugin),
-                )),
+                    denial_limit,
+                } => {
+                    self.set_classifier_denial_limit(denial_limit);
+                    let mut state = self.classifier.lock().unwrap_or_else(|e| e.into_inner());
+                    state.denials = state.denials.saturating_add(1);
+                    return Err(deny(
+                        DECISION_SOURCE_PLUGIN,
+                        PLUGIN_DENIED_REASON.to_owned(),
+                        guidance,
+                        Some(plugin),
+                    ));
+                }
+                LayerVerdict::Allow => {
+                    if layers.requires_human() {
+                        return Err(deny(
+                            DECISION_SOURCE_RULE,
+                            "Fixed guard changed during review; retry for human approval."
+                                .to_owned(),
+                            None,
+                            None,
+                        ));
+                    }
+                    if let PermissionCheck::Denied(reason) =
+                        check(tool, &scope_refs, scopes.force_prompt)
+                    {
+                        return Err(deny(DECISION_SOURCE_RULE, reason, None, None));
+                    }
+
+                    return allowed(DECISION_SOURCE_PLUGIN).map(|_| Some(plugin));
+                }
+                LayerVerdict::Deny { guidance } => {
+                    return Err(deny(
+                        DECISION_SOURCE_PLUGIN,
+                        PLUGIN_DENIED_REASON.to_owned(),
+                        guidance,
+                        Some(plugin),
+                    ));
+                }
             };
         }
 
@@ -899,6 +1432,7 @@ impl PermissionManager {
         };
         drop(guard);
 
+        self.reset_classifier_denials();
         self.apply_decision(&t2, &s2, &answer);
         let source = answer.decision_source();
         if answer.is_allow() {
@@ -1106,6 +1640,153 @@ fn write_rule_dir(scope: &str) -> PathBuf {
 mod tests {
     use super::*;
     use test_case::test_case;
+
+    #[test_case("cargo build" => true; "build")]
+    #[test_case("cargo check --offline --locked --frozen --release --workspace --all-targets --all-features --no-default-features --lib --bins --tests --benches --examples --quiet -q --verbose -v" => true; "standalone_flags")]
+    #[test_case("cargo clippy -p crate_1 --package crate-2 --bin app --test integration --bench perf --example demo" => true; "selectors")]
+    #[test_case("cargo test --features first,second_2,third-3" => true; "features")]
+    #[test_case("cargo test -j 1 --jobs 65535" => true; "jobs_bounds")]
+    #[test_case("cargo test module::case" => true; "qualified_filter")]
+    #[test_case("cargo test case --lib" => true; "filter_before_flag")]
+    #[test_case("cargo test -j 0" => false; "jobs_zero")]
+    #[test_case("cargo test --jobs 65536" => false; "jobs_overflow")]
+    #[test_case("cargo test --jobs 99999999999999999999" => false; "jobs_parse_overflow")]
+    #[test_case("cargo test -j -1" => false; "jobs_negative")]
+    #[test_case("cargo test -j 1.5" => false; "jobs_fraction")]
+    #[test_case("cargo test -j0" => false; "attached_jobs_zero")]
+    #[test_case("cargo test --jobs=1" => false; "equals_jobs")]
+    #[test_case("cargo test -p" => false; "missing_package")]
+    #[test_case("cargo test --package --lib" => false; "flag_as_package")]
+    #[test_case("cargo test --bin" => false; "missing_bin")]
+    #[test_case("cargo test --test" => false; "missing_test")]
+    #[test_case("cargo test --bench" => false; "missing_bench")]
+    #[test_case("cargo test --example" => false; "missing_example")]
+    #[test_case("cargo test --features" => false; "missing_features")]
+    #[test_case("cargo test --jobs" => false; "missing_jobs")]
+    #[test_case("cargo test --features first,,second" => false; "empty_feature")]
+    #[test_case("cargo test --features first," => false; "trailing_feature")]
+    #[test_case("cargo test --features ,first" => false; "leading_feature")]
+    #[test_case("cargo test --features first/second" => false; "dependency_feature")]
+    #[test_case("cargo test --features --lib" => false; "flag_as_feature")]
+    #[test_case("cargo test --features first.second" => false; "punctuated_feature")]
+    #[test_case("cargo test first second" => false; "second_filter")]
+    #[test_case("cargo test module::::case" => false; "empty_filter_component")]
+    #[test_case("cargo test module::" => false; "trailing_filter_component")]
+    #[test_case("cargo test ::case" => false; "leading_filter_component")]
+    #[test_case("cargo build case" => false; "build_filter")]
+    #[test_case("cargo test --bin ../app" => false; "selector_path")]
+    #[test_case("cargo test --unknown" => false; "unknown_flag")]
+    fn cargo_grammar_boundaries(command: &str) -> bool {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("Cargo.toml"), "[workspace]").unwrap();
+
+        bounded_project_command(&json!({"command": command, "workdir": project.path()}))
+    }
+
+    #[test_case("missing" => false; "missing_directory")]
+    #[test_case("plain" => false; "no_manifest")]
+    #[test_case(".ssh" => false; "secret_directory")]
+    #[test_case("project" => true; "project_directory")]
+    fn cargo_cwd_boundaries(directory: &str) -> bool {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["plain", ".ssh", "project"] {
+            let path = root.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            if name != "plain" {
+                std::fs::write(path.join("Cargo.toml"), "[workspace]").unwrap();
+            }
+        }
+
+        bounded_project_command(
+            &json!({"command": "cargo test", "workdir": root.path().join(directory)}),
+        )
+    }
+
+    #[test]
+    fn cargo_default_cwd_matches_explicit_process_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        let expected = bounded_project_command(&json!({"command":"cargo test", "workdir":cwd}));
+        assert!(expected, "test process starts in this Cargo project");
+        assert_eq!(
+            bounded_project_command(&json!({"command":"cargo test"})),
+            expected
+        );
+        assert_eq!(
+            bounded_project_command(&json!({"command":"cargo test", "workdir":null})),
+            expected
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_non_utf8_process_cwd_rejects_without_panicking() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::process::Command;
+
+        const CHILD: &str = "MAKI_TEST_NON_UTF8_CWD";
+        const SENTINEL: &str = "non-UTF8 cwd rejection verified";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(!bounded_project_command(&json!({"command":"cargo test"})));
+            println!("{SENTINEL}");
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join(OsString::from_vec(vec![b'p', 0xff]));
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::write(cwd.join("Cargo.toml"), "[workspace]").unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "permissions::tests::cargo_non_utf8_process_cwd_rejects_without_panicking",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("running 1 test"), "{stdout}");
+        assert!(stdout.contains(SENTINEL), "{stdout}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_cwd_symlinks_and_non_utf8_are_guarded_without_panicking() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        for name in [
+            OsString::from("project"),
+            OsString::from(".ssh"),
+            OsString::from_vec(vec![b'p', 0xff]),
+        ] {
+            let path = root.path().join(&name);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("Cargo.toml"), "[workspace]").unwrap();
+        }
+        for (link, target, expected) in [
+            ("ordinary", OsString::from("project"), true),
+            ("secret", OsString::from(".ssh"), false),
+            ("nonutf8", OsString::from_vec(vec![b'p', 0xff]), false),
+        ] {
+            let path = root.path().join(link);
+            symlink(root.path().join(target), &path).unwrap();
+            assert_eq!(
+                bounded_project_command(&json!({"command":"cargo test", "workdir":path})),
+                expected,
+                "{link}"
+            );
+        }
+    }
 
     const PLAN_FILE: &str = "/home/user/.local/state/maki/plans/test.md";
     const TEST_CWD: &str = "/tmp";
@@ -2493,6 +3174,393 @@ mod tests {
     const LAYER_SCOPE: &str = "rm -rf build";
     const LAYER_GUIDANCE: &str = "use trash instead";
     const ESCALATION: &str = "look at this";
+
+    #[test_case("read", "/tmp/project/.env", true ; "environment_file")]
+    #[test_case("write", "/tmp/project/.env.local", true ; "environment_variant")]
+    #[test_case("edit", "/tmp/project/.ssh/config", true ; "ssh_directory")]
+    #[test_case("multiedit", "/tmp/project/private.pem", true ; "private_key")]
+    #[test_case("read", "/tmp/project/main.rs", false ; "ordinary_file")]
+    #[test_case("grep", "/tmp/project/.env", false ; "search_is_not_covered")]
+    fn fixed_guard_file_classes(tool: &str, path: &str, guarded: bool) {
+        assert_eq!(
+            fixed_guard_reason(&ToolKey::native(tool), &json!({"path": path})).is_some(),
+            guarded
+        );
+    }
+
+    #[test_case("printf '%s\\n' 'observation'", false ; "literal_observation")]
+    #[test_case("printf '%s\\n' '$(cat .env)'", false ; "substitution_is_literal_inside_single_quotes")]
+    #[test_case("printf '%s\\n' 'ok' > output", true ; "redirection")]
+    #[test_case("printf '%s\\n' 'ok'; cat .env", true ; "command_chain")]
+    #[test_case("printf '%s\\n' \"$(cat .env)\"", true ; "dynamic_argument")]
+    #[test_case("printf '%s\\n' 'a' 'b'", true ; "multiple_arguments")]
+    #[test_case("printf '%s\\n' 'line\nbreak'", true ; "control_character")]
+    fn fixed_guard_shell_boundary(command: &str, guarded: bool) {
+        assert_eq!(
+            fixed_guard_reason(&ToolKey::native(BASH_TOOL), &json!({"command": command})).is_some(),
+            guarded
+        );
+    }
+
+    #[test]
+    fn fixed_guard_unknown_file_target_requires_human() {
+        assert_eq!(
+            fixed_guard_reason(&ToolKey::native("read"), &json!({})),
+            Some(UNKNOWN_FILE_REASON)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fixed_guard_follows_symlink_targets() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let secret = dir.path().join(".env");
+        std::fs::write(&secret, "test fixture").expect("fixture");
+        let alias = dir.path().join("ordinary.txt");
+        std::os::unix::fs::symlink(secret, &alias).expect("symlink");
+        assert_eq!(
+            fixed_guard_reason(&ToolKey::native("read"), &json!({"path": alias})),
+            Some(GUARDED_FILE_REASON)
+        );
+    }
+
+    struct ClassifierLayer {
+        binding: Value,
+        verdict: LayerVerdict,
+    }
+
+    impl PromptLayers for ClassifierLayer {
+        fn exact_binding(&self) -> Option<Value> {
+            Some(self.binding.clone())
+        }
+        fn answer<'a>(&'a self, _scopes: &'a [String]) -> BoxFuture<'a, Option<LayerAnswer>> {
+            Box::pin(std::future::ready(Some(LayerAnswer {
+                plugin: Arc::from(LAYER_PLUGIN),
+                verdict: self.verdict.clone(),
+            })))
+        }
+    }
+
+    fn classifier_call(manager: &PermissionManager, layer: &ClassifierLayer) -> bool {
+        let (events, _rx) = crate::event_stream();
+        smol::block_on(manager.enforce(
+            &ToolKey::native("read"),
+            &PermissionScopes::single("/tmp/input".into()),
+            None,
+            &events.sender(0),
+            None,
+            TAGGED_REQUEST_ID,
+            &CancelToken::none(),
+            None,
+            None,
+            Some(layer),
+        ))
+        .is_ok()
+    }
+
+    fn classifier_layer(reuse: bool) -> ClassifierLayer {
+        ClassifierLayer {
+            binding: json!({"session":"one", "authorization_revision":"1:2", "cwd":"/tmp", "input":{"path":"/tmp/input"}}),
+            verdict: LayerVerdict::ClassifierAllow {
+                policy_version: "test-v1".into(),
+                grant: !reuse,
+                reuse,
+                denial_limit: 3,
+            },
+        }
+    }
+
+    #[test]
+    fn classifier_exact_grants_are_volatile_and_bound() {
+        let manager = default_mgr();
+        assert!(classifier_call(&manager, &classifier_layer(false)));
+        assert!(classifier_call(&manager, &classifier_layer(true)));
+        for (field, value) in [
+            ("cwd", json!("/other")),
+            ("session", json!("two")),
+            ("authorization_revision", json!("2:2")),
+            ("input", json!({"path":"/other"})),
+        ] {
+            let mut changed = classifier_layer(true);
+            changed.binding[field] = value;
+            assert!(!classifier_call(&manager, &changed), "{field}");
+        }
+        assert!(manager.session_rules_snapshot().is_empty());
+        assert!(!classifier_call(&manager.fork(), &classifier_layer(true)));
+    }
+
+    #[test]
+    fn classifier_grant_expiration_policy_and_deny() {
+        let manager = default_mgr();
+        assert!(classifier_call(&manager, &classifier_layer(false)));
+        manager.classifier.lock().unwrap().grants[0].1 = Instant::now() - CLASSIFIER_GRANT_TTL;
+        assert!(!classifier_call(&manager, &classifier_layer(true)));
+        assert!(classifier_call(&manager, &classifier_layer(false)));
+        manager.plugin_rules.replace(LAYER_PLUGIN, Vec::new());
+        assert!(!classifier_call(&manager, &classifier_layer(true)));
+        assert!(classifier_call(&manager, &classifier_layer(false)));
+        manager.add_session_rule(PermissionRule {
+            tool: ToolKey::native("read"),
+            scope: None,
+            effect: Effect::Deny,
+        });
+        assert!(!classifier_call(&manager, &classifier_layer(true)));
+    }
+
+    #[test]
+    fn classifier_denials_and_resets_follow_observed_order() {
+        let manager = default_mgr();
+        manager.set_classifier_denial_limit(2);
+        let mut deny = classifier_layer(false);
+        deny.verdict = LayerVerdict::ClassifierDeny {
+            guidance: None,
+            denial_limit: 2,
+        };
+        assert!(!classifier_call(&manager, &deny));
+        manager.successful_tool_completion();
+        assert!(!classifier_call(&manager, &deny));
+        assert_eq!(manager.classifier.lock().unwrap().denials, 1);
+        assert!(!classifier_call(&manager, &deny));
+        assert!(!classifier_call(&manager, &classifier_layer(false)));
+        manager.successful_tool_completion();
+        assert!(classifier_call(&manager, &classifier_layer(false)));
+        assert!(!classifier_call(&manager, &deny));
+        manager.successful_tool_completion();
+        assert_eq!(manager.classifier.lock().unwrap().denials, 0);
+    }
+
+    #[test]
+    fn classifier_human_answer_resets_but_unattended_does_not() {
+        let manager = default_mgr();
+        manager.set_classifier_denial_limit(1);
+        manager.classifier.lock().unwrap().denials = 1;
+        assert!(!classifier_call(&manager, &classifier_layer(false)));
+        assert_eq!(manager.classifier.lock().unwrap().denials, 1);
+        let (events, _rx) = crate::event_stream();
+        let (tx, rx) = flume::unbounded();
+        tx.send(TaggedAnswer::new(TAGGED_REQUEST_ID, PermissionAnswer::AllowOnce).encode())
+            .unwrap();
+        let rx = smol::lock::Mutex::new(rx);
+        let layer = classifier_layer(false);
+        let result = smol::block_on(manager.enforce(
+            &ToolKey::native("read"),
+            &PermissionScopes::single("/tmp/input".into()),
+            None,
+            &events.sender(0),
+            Some(&rx),
+            TAGGED_REQUEST_ID,
+            &CancelToken::none(),
+            None,
+            None,
+            Some(&layer),
+        ));
+        assert!(result.is_ok());
+        assert_eq!(manager.classifier.lock().unwrap().denials, 0);
+    }
+
+    #[test_case(true ; "success_after_deny_resets")]
+    #[test_case(false ; "deny_after_success_counts")]
+    fn classifier_concurrent_outcomes_have_completion_order(success_last: bool) {
+        let manager = default_mgr();
+        let (tx, rx) = flume::bounded::<()>(1);
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                if success_last {
+                    let mut layer = classifier_layer(false);
+                    layer.verdict = LayerVerdict::ClassifierDeny {
+                        guidance: None,
+                        denial_limit: 3,
+                    };
+                    assert!(!classifier_call(&manager, &layer));
+                } else {
+                    manager.successful_tool_completion();
+                }
+                tx.send(()).unwrap();
+            });
+            let second = scope.spawn(|| {
+                rx.recv().unwrap();
+                if success_last {
+                    manager.successful_tool_completion();
+                } else {
+                    let mut layer = classifier_layer(false);
+                    layer.verdict = LayerVerdict::ClassifierDeny {
+                        guidance: None,
+                        denial_limit: 3,
+                    };
+                    assert!(!classifier_call(&manager, &layer));
+                }
+            });
+            first.join().unwrap();
+            second.join().unwrap();
+        });
+        assert_eq!(
+            manager.classifier_denials_for_test(None),
+            usize::from(!success_last)
+        );
+    }
+
+    struct GuardedClassifier;
+
+    impl PromptLayers for GuardedClassifier {
+        fn requires_human(&self) -> bool {
+            true
+        }
+        fn answer<'a>(&'a self, _scopes: &'a [String]) -> BoxFuture<'a, Option<LayerAnswer>> {
+            Box::pin(std::future::ready(Some(LayerAnswer {
+                plugin: Arc::from(LAYER_PLUGIN),
+                verdict: LayerVerdict::ClassifierAllow {
+                    policy_version: "test-v1".into(),
+                    grant: true,
+                    reuse: false,
+                    denial_limit: 3,
+                },
+            })))
+        }
+    }
+
+    #[test]
+    fn classifier_cannot_override_changed_guard() {
+        let manager = default_mgr();
+        let (events, _rx) = crate::event_stream();
+        let result = smol::block_on(manager.enforce(
+            &ToolKey::native("read"),
+            &PermissionScopes::single("/tmp/input".into()),
+            None,
+            &events.sender(0),
+            None,
+            TAGGED_REQUEST_ID,
+            &CancelToken::none(),
+            None,
+            None,
+            Some(&GuardedClassifier),
+        ));
+        assert!(result.is_err());
+        assert!(manager.classifier.lock().unwrap().grants.is_empty());
+    }
+
+    #[test]
+    fn classifier_resume_discards_runtime_state() {
+        let manager = default_mgr();
+        assert!(classifier_call(&manager, &classifier_layer(false)));
+        manager.load_session_rules(Vec::new());
+        assert!(!classifier_call(&manager, &classifier_layer(true)));
+    }
+
+    const COVERED_SCOPE: &str = "git status";
+
+    struct MetadataLayer<'a> {
+        manager: &'a PermissionManager,
+        late_deny: Option<bool>,
+    }
+
+    impl PromptLayers for MetadataLayer<'_> {
+        fn answer<'a>(&'a self, _scopes: &'a [String]) -> BoxFuture<'a, Option<LayerAnswer>> {
+            panic!("metadata method must be used")
+        }
+
+        fn answer_with_metadata<'a>(
+            &'a self,
+            scopes: &'a [String],
+            metadata: &'a Value,
+        ) -> BoxFuture<'a, Option<LayerAnswer>> {
+            Box::pin(async move {
+                assert_eq!(scopes, &[LAYER_SCOPE]);
+                assert_eq!(metadata["all_scopes"], json!([COVERED_SCOPE, LAYER_SCOPE]));
+                assert_eq!(metadata["policy"]["complete"], true);
+                assert_eq!(metadata["subject_kind"], "shell_scope");
+                assert_eq!(metadata["subjects_resolved"], false);
+                if let Some(plugin) = self.late_deny {
+                    let rule = deny_rule(COVERED_SCOPE);
+                    if plugin {
+                        self.manager.plugin_rules.replace(LAYER_PLUGIN, vec![rule]);
+                    } else {
+                        self.manager.add_session_rule(rule);
+                    }
+                }
+                Some(LayerAnswer {
+                    plugin: Arc::from(LAYER_PLUGIN),
+                    verdict: LayerVerdict::Allow,
+                })
+            })
+        }
+    }
+
+    #[test_case(None, true ; "full_scopes_and_unresolved_scopes_are_separate")]
+    #[test_case(Some(false), false ; "late_session_deny_on_previously_allowed_scope_wins")]
+    #[test_case(Some(true), false ; "late_plugin_deny_on_previously_allowed_scope_wins")]
+    fn metadata_and_late_deny(late_deny: Option<bool>, allowed: bool) {
+        let mgr = mgr_with(
+            make_config(vec![allow_rule(COVERED_SCOPE)]),
+            PathBuf::from(TEST_CWD),
+        );
+        let layer = MetadataLayer {
+            manager: &mgr,
+            late_deny,
+        };
+        let scopes = PermissionScopes {
+            scopes: vec![COVERED_SCOPE.to_owned(), LAYER_SCOPE.to_owned()],
+            force_prompt: false,
+        };
+        let (guard, _events) = crate::event_stream();
+        let result = smol::block_on(mgr.enforce(
+            &ToolKey::native(BASH_TOOL),
+            &scopes,
+            None,
+            &guard.sender(0),
+            None,
+            TAGGED_REQUEST_ID,
+            &CancelToken::none(),
+            None,
+            None,
+            Some(&layer),
+        ));
+        assert_eq!(result.is_ok(), allowed, "{result:?}");
+        if !allowed {
+            assert!(result.unwrap_err().to_string().contains(COVERED_SCOPE));
+        }
+    }
+
+    #[test]
+    fn oversized_policy_is_explicitly_incomplete() {
+        let scope = "x".repeat(PROMPT_POLICY_MAX_BYTES);
+        let mgr = mgr_with(
+            make_config(vec![allow_rule(&scope)]),
+            PathBuf::from(TEST_CWD),
+        );
+        let metadata = mgr.prompt_metadata(
+            &ToolKey::native(BASH_TOOL),
+            &PermissionScopes::single(LAYER_SCOPE.to_owned()),
+        );
+        assert_eq!(
+            metadata["policy"],
+            json!({"complete": false, "reason": "policy_size_limit"})
+        );
+        assert_eq!(metadata["all_scopes"], json!([LAYER_SCOPE]));
+    }
+
+    #[test]
+    fn metadata_includes_live_rule_origins_and_defaults() {
+        let mgr = mgr_with(
+            make_config(vec![allow_rule(COVERED_SCOPE)]),
+            PathBuf::from(TEST_CWD),
+        );
+        mgr.add_session_rule(deny_rule(LAYER_SCOPE));
+        mgr.plugin_rules
+            .replace(LAYER_PLUGIN, vec![allow_rule("pwd")]);
+        let metadata = mgr.prompt_metadata(
+            &ToolKey::native(BASH_TOOL),
+            &PermissionScopes::single(LAYER_SCOPE.to_owned()),
+        );
+        let rules = metadata["policy"]["rules"].as_array().expect("rules");
+        for origin in [ORIGIN_CONFIG, ORIGIN_BUILTIN, ORIGIN_SESSION, ORIGIN_PLUGIN] {
+            assert!(
+                rules.iter().any(|rule| rule["origin"] == origin),
+                "{origin}"
+            );
+        }
+        assert_eq!(metadata["policy"]["default"], "prompt");
+        assert_eq!(metadata["candidate_rules"][0]["scope"], LAYER_SCOPE);
+    }
 
     struct Layer(Option<LayerVerdict>);
 

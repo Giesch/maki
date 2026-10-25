@@ -198,7 +198,7 @@ impl PluginPermissions {
     pub fn holds_all_reach(&self) -> bool {
         Permission::ALL
             .iter()
-            .all(|&perm| perm == Permission::Agent || self.is_allowed(perm))
+            .all(|&perm| !perm.is_execution() || perm == Permission::Agent || self.is_allowed(perm))
     }
 
     pub fn from_manifest(manifest: &toml::Value) -> Self {
@@ -208,7 +208,7 @@ impl PluginPermissions {
             allowed[perm as usize] = perms
                 .and_then(|p| p.get(perm.manifest_key()))
                 .and_then(toml::Value::as_bool)
-                .unwrap_or(true);
+                .unwrap_or(perm.is_execution());
         }
         Self {
             allowed,
@@ -743,7 +743,7 @@ mod tests {
         let val: toml::Value = toml::from_str("[package]\nname = \"test\"").unwrap();
         let p = PluginPermissions::from_manifest(&val);
         for &perm in Permission::ALL {
-            assert!(p.is_allowed(perm), "{perm} should default to allowed");
+            assert_eq!(p.is_allowed(perm), perm != Permission::PermissionReviewRead);
         }
     }
 
@@ -813,7 +813,10 @@ mod tests {
         let legacy = PluginPermissions::from_manifest(&val);
         let requested = Requested::from_manifest(&val);
         for &perm in Permission::ALL {
-            assert!(legacy.is_allowed(perm), "legacy stays permissive");
+            assert_eq!(
+                legacy.is_allowed(perm),
+                perm != Permission::PermissionReviewRead
+            );
             assert!(!requested.is_requested(perm), "package requests nothing");
         }
     }
@@ -942,7 +945,10 @@ mod tests {
         fs::write(dir.path().join(MANIFEST_FILE), "").unwrap();
         let permissions = load_plugin_permissions(Some(dir.path()));
         for &permission in Permission::ALL {
-            assert!(permissions.is_allowed(permission));
+            assert_eq!(
+                permissions.is_allowed(permission),
+                permission != Permission::PermissionReviewRead
+            );
         }
 
         fs::write(dir.path().join(MANIFEST_FILE), "not = [valid").unwrap();

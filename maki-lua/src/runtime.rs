@@ -69,7 +69,7 @@ use crate::error::PluginError;
 use crate::key_lint::KeyLint;
 use crate::loader::EventHandle;
 use crate::pack::Interaction;
-use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
+use crate::plugin_permissions::{Permission, PluginPermissions, load_plugin_permissions};
 
 const INTERRUPT_SHUTDOWN_MSG: &str = "plugin interrupted: host shutting down";
 const INTERRUPT_CANCELLED_MSG: &str = "plugin interrupted: task cancelled";
@@ -3768,11 +3768,17 @@ fn layer_delegation<'a>(
         let loaded = plugins.borrow();
         let granted = loaded.get(plugin).map(|owner| &owner.permissions);
         let held = match authority {
-            Authority::Capability(required) => granted.is_some_and(|p| p.is_allowed(required)),
+            Authority::Capability(required) => {
+                required.is_execution() && granted.is_some_and(|p| p.is_allowed(required))
+            }
             // Steering a call whose reach nobody declared takes every
             // capability: a meta-tool like `batch` names none and reaches all.
             Authority::Unbounded => granted.is_some_and(PluginPermissions::holds_all_reach),
-            Authority::Total => granted.is_some_and(PluginPermissions::holds_all),
+            Authority::Total => granted.is_some_and(|p| {
+                Permission::ALL
+                    .iter()
+                    .all(|&permission| !permission.is_execution() || p.is_allowed(permission))
+            }),
         };
         if !held {
             // Every call of a layered tool re-decides this, so a warning here
@@ -4099,6 +4105,8 @@ async fn run_prompt(
         req,
         ctx,
     } = run;
+    let read_review = req.get("tool").and_then(Value::as_str) == Some("read")
+        && matches!(authority, Authority::Capability(Permission::FsRead));
     let (Ok(req), Ok(ctx), Ok(default)) = (
         json_to_lua(lua, &req),
         lua.create_userdata(*ctx),
@@ -4121,7 +4129,17 @@ async fn run_prompt(
             *decided = Some((table.clone(), Arc::clone(plugin)));
         }
     });
-    let allow_layer = layer_delegation(plugins, authority, slot);
+    let delegated = layer_delegation(plugins, authority, slot);
+    let allow_layer = |plugin: &str| {
+        delegated(plugin)
+            || (read_review
+                && crate::api::slot::routes_reads_for(lua, plugin)
+                && plugins.borrow().get(plugin).is_some_and(|owner| {
+                    owner
+                        .permissions
+                        .is_allowed(Permission::PermissionReviewRead)
+                }))
+    };
     let names = [slot];
     let chain = run_host_chain_with(lua, &names, default, args, &allow_layer, Some(observe));
     let table = match run_awaited(lua, gate, cancel, deadline, chain).await {
@@ -4168,6 +4186,34 @@ async fn run_prompt(
 fn prompt_answer(table: &Table) -> mlua::Result<LayerVerdict> {
     let decision: String = table.get("decision")?;
     let guidance: Option<String> = table.get("guidance")?;
+    let classifier: bool = table.get::<Option<bool>>("classifier")?.unwrap_or(false);
+    if classifier {
+        let denial_limit = table.get::<Option<usize>>("denial_limit")?.unwrap_or(3);
+        if !(1..=100).contains(&denial_limit) {
+            return Err(mlua::Error::runtime(
+                "classifier denial_limit must be between 1 and 100",
+            ));
+        }
+
+        return match decision.as_str() {
+            "allow" => Ok(LayerVerdict::ClassifierAllow {
+                policy_version: table
+                    .get::<Option<String>>("policy_version")?
+                    .unwrap_or_default(),
+                grant: table.get::<Option<bool>>("exact_grant")?.unwrap_or(false),
+                reuse: table.get::<Option<bool>>("reuse_grant")?.unwrap_or(false),
+                denial_limit,
+            }),
+            "deny" => Ok(LayerVerdict::ClassifierDeny {
+                guidance: guidance.filter(|g| !g.is_empty()),
+                denial_limit,
+            }),
+            _ => Err(mlua::Error::runtime(
+                "classifier decision must be allow or deny",
+            )),
+        };
+    }
+
     match decision.as_str() {
         "allow" => Ok(LayerVerdict::Allow),
         "deny" => Ok(LayerVerdict::Deny {
@@ -4176,6 +4222,34 @@ fn prompt_answer(table: &Table) -> mlua::Result<LayerVerdict> {
         other => Err(mlua::Error::runtime(format!(
             "a permission.prompt layer answers 'allow' or 'deny', not '{other}'"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod classifier_response_tests {
+    use super::prompt_answer;
+    use maki_agent::permissions::LayerVerdict;
+    use mlua::Lua;
+
+    #[test]
+    fn classifier_response_is_explicit_and_bounded() {
+        let lua = Lua::new();
+        let table = lua.create_table().unwrap();
+        table.set("decision", "allow").unwrap();
+        assert_eq!(prompt_answer(&table).unwrap(), LayerVerdict::Allow);
+        table.set("classifier", true).unwrap();
+        table.set("exact_grant", true).unwrap();
+        assert_eq!(
+            prompt_answer(&table).unwrap(),
+            LayerVerdict::ClassifierAllow {
+                policy_version: String::new(),
+                grant: true,
+                reuse: false,
+                denial_limit: 3
+            }
+        );
+        table.set("denial_limit", 0).unwrap();
+        assert!(prompt_answer(&table).is_err());
     }
 }
 
