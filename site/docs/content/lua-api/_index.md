@@ -64,6 +64,7 @@ permission raises `permission denied: '<name>' not granted for this plugin`.
 - `run`: starting processes
 - `env`: reading the process environment, where secrets live
 - `agent`: starting model turns: prompting a chat, or running its own sessions
+- `permission_review_read`: reviewing native read permission prompts with explicit read routing; no filesystem API access
 
 Grants come from a `plugin.toml` next to the Lua file (for
 `~/.config/maki/init.lua` that is `~/.config/maki/plugin.toml`):
@@ -78,14 +79,16 @@ net = true
 run = true
 env = true
 agent = true
+permission_review_read = true
 ```
 
 The rules:
 
 - No `plugin.toml` at all: every permission is denied, and maki logs a
   warning at load time.
-- `plugin.toml` exists: permissions default to granted; set a key to
-  `false` to revoke it. An empty file grants everything.
+- A local `plugin.toml` grants execution permissions by default. Set a key to
+  `false` to revoke it. `permission_review_read` requires an explicit `true`,
+  so an empty file does not grant read-review authority.
 - Invalid TOML: everything denied, with a warning in the log.
 - A package, or a plugin maki ships, is read the other way round: a key it
   does not name is not requested, so its `plugin.toml` lists everything it
@@ -1054,7 +1057,7 @@ print(render("hello")) -- HELLO
 ### `maki.api.set_slot()` {#maki-api-set_slot}
 
 ```lua
-maki.api.set_slot({name}, {wrapper})
+maki.api.set_slot({name}, {wrapper}, {opts?})
 ```
 
 Add a layer around an existing (or future) slot. Layers wrap the
@@ -1108,10 +1111,21 @@ when the chain fires: the call skips a layer that is not entitled and
 carries on, and a reload that changes what you hold takes effect on the
 next call.
 
+Read review without filesystem access requires `[permissions] permission_review_read = true`
+in `plugin.toml` (and package approval), plus `{route_absolute_reads=true}` below.
+Unlike execution capabilities, `permission_review_read` defaults to false even for local manifests.
+It authorizes only this plugin's `permission.prompt` layers for native `read` calls
+declaring `fs_read`. Tool input, call, and output layers still require `fs_read`.
+Filesystem APIs remain denied. The reviewer must restrict its own model tools and MCP access.
+Ordinary denies, secret guards, and forced human prompts still take precedence.
+
 **Parameters:**
 
 - `{name}` (`string`) Slot name to wrap.
 - `{wrapper}` (`function`) Layer: `function(prev, ...)`. Call `prev(...)` to continue.
+- `{opts?}` (`table?`) For `permission.prompt`, `{route_absolute_reads=true}` requires `permission_review_read` and routes otherwise-unscoped absolute native reads through permissions. Missing authority raises before registration. This never approves a call or grants reviewer filesystem access. Unloading the plugin removes its opt-in.
+
+**Returns:** (`table`) Registration acknowledgement `{ route_absolute_reads = boolean }`. True means this call requested and registered read routing for this plugin and the routing was published. False means this call did not request routing, even if an earlier layer still enables it. Errors raise without an acknowledgement. Older hosts return nil. Check for true before relying on routing.
 
 **Example:**
 
@@ -1485,9 +1499,10 @@ through optional callbacks while the tool runs.
 - `{opts?}` (`table?`) Optional fields:
   - `timeout` (`integer?`) deadline in seconds.
   - `output_mode` (`string?`) "full" (default) returns the complete text.
-    "compact" returns what the model would get, with output limits and
-    RTK rewriting. Permissions and hooks apply in both modes, and hooks
-    see the mode as `ctx.output_mode`.
+    "compact" returns what the model would get, with output limits.
+    Bundled Bash does not automatically rewrite commands with RTK in either mode.
+    Permissions and hooks apply in both modes, and hooks see the mode as
+    `ctx.output_mode`.
   - `on_live_buf` (`function?`) called with a `BufHandle` for each live buffer
     the tool publishes. Must not yield.
   - `on_annotation` (`function?`) called with an annotation string for each
@@ -4723,6 +4738,36 @@ local last = msgs and msgs[1]
 if last and last.role == "assistant" then
   print(last.content[1].text)
 end
+```
+
+---
+
+### `maki.session.user_prompts()` {#maki-session-user_prompts}
+
+```lua
+maki.session.user_prompts({opts})
+```
+
+Reads exact trusted human text in the named live session, oldest first.
+Only direct TUI submissions are currently trusted; ACP, SDK, plugins,
+delegated inputs, summaries and legacy turns cannot establish human origin.
+Text is captured before input hooks rewrite it. Images are not included.
+`complete` must be true before using the result as authorization evidence.
+Compacted/replaced or legacy histories return false. A byte overflow returns
+no prompts, never a truncated prefix. The budget counts UTF-8 prompt bytes.
+`revision` is an opaque process-local snapshot token, not a durable cache key.
+No focused-session fallback is used, including in child tasks.
+
+**Parameters:**
+
+- `{opts}` (`table`) `session` (string) and `max_bytes` (integer, 1..1048576), required.
+
+**Returns:** (`table|nil`, `string|nil`) `{session, complete, revision, prompts}`, or nil and an error.
+
+**Example:**
+
+```lua
+local history, err = maki.session.user_prompts({ session = id, max_bytes = 65536 })
 ```
 
 ---
