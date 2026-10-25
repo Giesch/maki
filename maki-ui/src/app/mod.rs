@@ -2129,6 +2129,7 @@ impl App {
         let mut input = self.build_agent_input(&QueuedMessage {
             text: display_text.clone(),
             images: Vec::new(),
+            source: maki_agent::InputSource::Plugin,
         });
         input.prompt = Some(Box::new(prompt_ref));
 
@@ -2172,6 +2173,7 @@ impl App {
         self.submit_or_queue(QueuedMessage {
             text: cmd.render(args),
             images: Vec::new(),
+            source: maki_agent::InputSource::Plugin,
         })
     }
 
@@ -2688,6 +2690,7 @@ impl App {
         let msg = QueuedMessage {
             text,
             images: vec![],
+            source: maki_agent::InputSource::Plugin,
         };
         actions.extend(self.start_from_queue(&msg));
         actions

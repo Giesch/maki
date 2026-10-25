@@ -40,6 +40,13 @@ pub fn live_history(session: MakiId) -> Option<Arc<Vec<Message>>> {
     Some(Arc::clone(&mirror.load().messages))
 }
 
+pub fn live_prompt_history(session: MakiId) -> Option<Arc<HistorySnapshot>> {
+    let live = LIVE_HISTORIES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    Some(live.get(&session)?.upgrade()?.load_full())
+}
+
 pub struct History {
     /// The value the mirror publishes, held whole so the two can never
     /// disagree and so a new run can never inherit the last one's epoch.
@@ -160,7 +167,8 @@ impl History {
         &self.snapshot.messages
     }
 
-    pub fn push(&mut self, msg: Message) {
+    pub fn push(&mut self, mut msg: Message) {
+        msg.prompt_history_start = self.is_empty();
         self.edit(|msgs| msgs.push(msg));
     }
 
@@ -207,7 +215,11 @@ impl History {
             .count() as u32
     }
 
-    pub fn replace(&mut self, messages: Vec<Message>) {
+    pub fn replace(&mut self, mut messages: Vec<Message>) {
+        for message in &mut messages {
+            message.prompt_history_start = false;
+            message.human_prompt = None;
+        }
         self.rewrite(|msgs| *msgs = messages);
     }
 
@@ -387,6 +399,59 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+
+    #[test]
+    fn compaction_restart_drops_authorization_provenance() {
+        const TEXT: &str = "exact human wording";
+        let mut history = History::new(Vec::new());
+        history.push(Message {
+            human_prompt: Some(TEXT.into()),
+            ..Message::user(TEXT.into())
+        });
+        let epoch = history.snapshot.epoch;
+        history.restart(history.as_slice().to_vec());
+        assert_ne!(history.snapshot.epoch, epoch);
+        assert!(
+            history
+                .as_slice()
+                .iter()
+                .all(|message| !message.prompt_history_start && message.human_prompt.is_none())
+        );
+        let stored = serde_json::to_vec(history.as_slice()).unwrap();
+        let resumed = History::restored(serde_json::from_slice(&stored).unwrap());
+        assert!(!resumed.as_slice()[0].prompt_history_start);
+        assert_eq!(resumed.as_slice()[0].human_prompt, None);
+    }
+
+    #[test]
+    fn prompt_history_start_follows_restart_resume_and_rewind() {
+        let mut history = History::new(Vec::new());
+        history.push(Message::observation(FIRST.into()));
+        history.push(Message::user(SECOND.into()));
+        assert!(history.as_slice()[0].prompt_history_start);
+        assert!(!history.as_slice()[1].prompt_history_start);
+        history.restart(vec![Message::synthetic(GO.into())]);
+        history.push(Message::user(SECOND.into()));
+        assert!(
+            history
+                .as_slice()
+                .iter()
+                .all(|message| !message.prompt_history_start)
+        );
+        let serialized = serde_json::to_vec(history.as_slice()).unwrap();
+        let mut restored = History::restored(serde_json::from_slice(&serialized).unwrap());
+        restored.push(Message::user(FIRST.into()));
+        assert!(
+            restored
+                .as_slice()
+                .iter()
+                .all(|message| !message.prompt_history_start)
+        );
+        restored.truncate(0);
+        restored.push(Message::user(GO.into()));
+        assert!(restored.as_slice()[0].prompt_history_start);
+        assert_eq!(restored.len(), 1);
+    }
 
     const FIRST: &str = "first";
     const SECOND: &str = "second";

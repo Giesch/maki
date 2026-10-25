@@ -310,6 +310,7 @@ impl<'h> Agent<'h> {
             .chain([(message, images, preamble)]);
         let mut prompt = None;
         for (message, images, preamble) in burst {
+            let human_prompt = trusted_prompt(source, self.task_id.as_deref(), &message);
             let kept = match self
                 .filter_user_message(message, images.len(), source)
                 .await
@@ -324,7 +325,10 @@ impl<'h> Agent<'h> {
             }
             let kept = kept.map(|text| {
                 prompt = Some(text.clone());
-                Message::user_with_images(text, images)
+                Message {
+                    human_prompt,
+                    ..Message::user_with_images(text, images)
+                }
             });
             self.land_input(preamble, kept)?;
         }
@@ -1096,10 +1100,15 @@ impl<'h> Agent<'h> {
                         text: input.message.clone(),
                         images: input.images.clone(),
                     })?;
+                    let human_prompt =
+                        trusted_prompt(input.source, self.task_id.as_deref(), &input.message);
                     let kept = self
                         .filter_user_message(input.message, input.images.len(), input.source)
                         .await?;
-                    let message = kept.map(|text| interrupt_message(text, input.images));
+                    let message = kept.map(|text| Message {
+                        human_prompt,
+                        ..interrupt_message(text, input.images)
+                    });
                     if message.is_some() {
                         self.mode = input.mode;
                         // The user spoke, so `agent.stop` gets its full
@@ -1135,6 +1144,10 @@ fn no_frame() -> AgentError {
     }
 }
 
+fn trusted_prompt(source: InputSource, task_id: Option<&str>, text: &str) -> Option<String> {
+    (source == InputSource::Tui && task_id.is_none() && !text.is_empty()).then(|| text.to_owned())
+}
+
 fn interrupt_message(message: String, images: Vec<ImageSource>) -> Message {
     let wrapped = format!("<user-interrupt>\n{INTERRUPT_NOTE}\n\n{message}\n</user-interrupt>");
     Message {
@@ -1161,6 +1174,24 @@ mod tests {
     };
     use serde_json::Value;
     use test_case::test_case;
+
+    #[test_case(InputSource::Tui, None, true; "direct_tui")]
+    #[test_case(InputSource::Tui, Some("task"), false; "delegated_tui")]
+    #[test_case(InputSource::Plugin, None, false; "plugin")]
+    #[test_case(InputSource::Headless, None, false; "headless")]
+    #[test_case(InputSource::Acp, None, false; "acp")]
+    fn prompt_provenance_requires_direct_human_source(
+        source: InputSource,
+        task: Option<&str>,
+        trusted: bool,
+    ) {
+        const TEXT: &str = "human text";
+        assert_eq!(
+            trusted_prompt(source, task, TEXT).as_deref(),
+            trusted.then_some(TEXT)
+        );
+        assert_eq!(trusted_prompt(source, task, ""), None);
+    }
 
     use super::compaction::FIELD_CONTINUE;
     use super::*;
@@ -3376,8 +3407,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn user_message_rewrite_is_what_the_model_sees() {
+    #[test_case(InputSource::Tui, None, true; "human")]
+    #[test_case(InputSource::Plugin, None, false; "plugin")]
+    #[test_case(InputSource::Tui, Some("synthetic-task"), false; "subagent")]
+    fn user_message_rewrite_preserves_only_direct_human_provenance(
+        source: InputSource,
+        task: Option<&str>,
+        trusted: bool,
+    ) {
         smol::block_on(async {
             let mut history = History::new(Vec::new());
             let (mut agent, event_rx) = make_agent(
@@ -3389,16 +3426,51 @@ mod tests {
                 answer_only(AgentSlot::UserMessage, json!({ FIELD_TEXT: REWRITTEN })),
             );
 
-            agent.run(default_input()).await.unwrap();
+            agent.task_id = task.map(Arc::from);
+            let mut input = default_input();
+            input.source = source;
+            let original = input.message.clone();
+            agent.run(input).await.unwrap();
             drop(agent);
 
+            assert_eq!(
+                history.as_slice()[0].human_prompt.as_deref(),
+                trusted.then_some(original.as_str())
+            );
             assert_eq!(history.as_slice()[0].user_text(), Some(REWRITTEN));
             let (slot, value) = seen.lock().unwrap()[0].clone();
             assert_eq!(slot, AgentSlot::UserMessage);
-            assert_eq!(value["source"], InputSource::Tui.as_str());
+            assert_eq!(value["source"], source.as_str());
             assert_eq!(
                 steers(&drain_events(&event_rx)),
                 [(SteerKind::MessageRewritten, REWRITTEN.to_owned())]
+            );
+        });
+    }
+
+    #[test_case(InputSource::Tui, true; "human_interrupt")]
+    #[test_case(InputSource::Plugin, false; "plugin_interrupt")]
+    fn queued_rewrite_captures_original_human_text(source: InputSource, trusted: bool) {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (mut agent, _events) = make_agent(MockProvider::new(Vec::new()), &mut history);
+            let mut input = default_input();
+            input.source = source;
+            let original = input.message.clone();
+            agent = agent.with_interrupt_source(MockInterruptSource::new(vec![
+                ExtractedCommand::Interrupt(vec![input]),
+            ]));
+            script(
+                &agent.registry,
+                answer_only(AgentSlot::UserMessage, json!({ FIELD_TEXT: REWRITTEN })),
+            );
+            assert!(agent.handle_queued_command().await.unwrap());
+            drop(agent);
+            let message = history.as_slice().last().unwrap();
+            assert_eq!(message.user_text(), Some(REWRITTEN));
+            assert_eq!(
+                message.human_prompt.as_deref(),
+                trusted.then_some(original.as_str())
             );
         });
     }
@@ -3493,6 +3565,16 @@ mod tests {
                 .filter_map(Message::user_text)
                 .collect();
             assert_eq!(users, expected);
+            let trusted: Vec<_> = history
+                .as_slice()
+                .iter()
+                .filter_map(|message| message.human_prompt.as_deref())
+                .collect();
+            let expected_trusted: Vec<_> = [first, last]
+                .into_iter()
+                .filter(|text| *text != BLOCKED)
+                .collect();
+            assert_eq!(trusted, expected_trusted);
         });
     }
 

@@ -251,6 +251,7 @@ impl App {
             self.queue_and_notify(QueuedMessage {
                 text,
                 images: Vec::new(),
+                source: InputSource::Plugin,
             });
         }
     }
@@ -289,6 +290,7 @@ impl App {
         let mut input = self.build_agent_input(&QueuedMessage {
             text: String::new(),
             images: Vec::new(),
+            source: InputSource::Plugin,
         });
         input.preamble = preamble;
         self.start_run(input, String::new())

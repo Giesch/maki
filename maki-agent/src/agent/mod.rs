@@ -11,7 +11,7 @@ pub use compaction::compact;
 pub use frame::{RunContext, RunContextBuilder, plan_mode_update};
 pub use history::{
     History, HistorySnapshot, SharedMessages, UNAVAILABLE_RESULT, close_dangling_tool_calls,
-    live_history, publish_live_history,
+    live_history, live_prompt_history, publish_live_history,
 };
 pub use hook::{AgentCall, AgentHook, AgentHooks, AgentSlot};
 pub use instructions::{
