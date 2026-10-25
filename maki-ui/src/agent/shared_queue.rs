@@ -11,7 +11,8 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use maki_agent::{
-    AgentInput, AgentMode, EarlierInput, ExtractedCommand, ImageSource, InterruptSource,
+    AgentInput, AgentMode, EarlierInput, ExtractedCommand, ImageSource, InputSource,
+    InterruptSource,
 };
 
 use crate::components::input::Submission;
@@ -22,11 +23,12 @@ const COMPACT_LABEL: &str = "/compact";
 
 type Items = Arc<Mutex<VecDeque<QueueItem>>>;
 /// What a message must agree on with its neighbours to share their turn.
-type BatchKey = (AgentMode, bool);
+type BatchKey = (AgentMode, bool, InputSource);
 
 pub(crate) struct QueuedMessage {
     pub(crate) text: String,
     pub(crate) images: Vec<ImageSource>,
+    pub(crate) source: InputSource,
 }
 
 impl From<Submission> for QueuedMessage {
@@ -34,6 +36,7 @@ impl From<Submission> for QueuedMessage {
         Self {
             text: sub.text,
             images: sub.images,
+            source: InputSource::Tui,
         }
     }
 }
@@ -68,9 +71,9 @@ impl QueuedInput {
             earlier: _,
             thinking: _,
             fast: _,
-            source: _,
+            source,
         } = &self.input;
-        prompt.is_none().then(|| (mode.clone(), *workflow))
+        prompt.is_none().then(|| (mode.clone(), *workflow, *source))
     }
 }
 
@@ -342,6 +345,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn human_and_plugin_inputs_do_not_share_a_batch() {
+        const TEXT: &str = "input";
+        let human = queued(TEXT, 0);
+        let mut plugin = queued(TEXT, 0);
+        plugin.input.source = InputSource::Plugin;
+        assert_ne!(human.batch_key(), plugin.batch_key());
+    }
+
+    fn plugin_message(text: &str) -> QueueItem {
+        let mut queued = queued(text, 0);
+        queued.input.source = InputSource::Plugin;
+
+        QueueItem::Message(queued)
+    }
+
     fn message(text: &str) -> QueueItem {
         QueueItem::Message(queued(text, 0))
     }
@@ -436,6 +455,7 @@ mod tests {
     #[test_case(vec![message(FIRST), message(SECOND), message(THIRD)], vec![vec![FIRST, SECOND, THIRD]] ; "adjacent_messages_ride_together")]
     #[test_case(vec![message(FIRST), compact(None), message(SECOND)], vec![vec![FIRST], vec![COMPACT_LABEL], vec![SECOND]] ; "compact_splits_the_drain_and_keeps_its_place")]
     #[test_case(vec![message(FIRST), prompt_message(SECOND), message(THIRD)], vec![vec![FIRST], vec![SECOND], vec![THIRD]] ; "mcp_prompt_runs_alone")]
+    #[test_case(vec![message(FIRST), plugin_message(SECOND), message(THIRD)], vec![vec![FIRST], vec![SECOND], vec![THIRD]] ; "source_change_splits_the_drain")]
     #[test_case(vec![message(FIRST)], vec![vec![FIRST]] ; "single_message_unchanged")]
     #[test_case(vec![plan_message(FIRST), plan_message(SECOND)], vec![vec![FIRST, SECOND]] ; "one_mode_rides_together")]
     #[test_case(vec![plan_message(FIRST), message(SECOND)], vec![vec![FIRST], vec![SECOND]] ; "mode_change_splits_the_drain")]

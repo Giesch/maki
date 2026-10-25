@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use crate::agent::QueuedMessage;
 use crate::components::Status;
 use crate::theme;
-use maki_agent::{AgentInput, AgentMode, InputSource};
+use maki_agent::{AgentInput, AgentMode};
 use maki_providers::RequestOptions;
 use maki_storage::StateDir;
 use maki_storage::plans;
@@ -158,7 +158,7 @@ impl App {
             fast,
             workflow: self.state.workflow,
             prompt: None,
-            source: InputSource::Tui,
+            source: msg.source,
         }
     }
 

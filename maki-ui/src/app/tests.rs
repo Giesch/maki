@@ -775,6 +775,7 @@ fn queued_msg(text: &str) -> QueuedMessage {
     QueuedMessage {
         text: text.into(),
         images: vec![],
+        source: maki_agent::InputSource::Tui,
     }
 }
 
@@ -6025,12 +6026,25 @@ fn fast_toggle_on_off_on_opus() {
     assert_eq!(app.status_bar.flash_text(), Some(FAST_OFF_MSG));
 }
 
+#[test_case(maki_agent::InputSource::Tui; "human")]
+#[test_case(maki_agent::InputSource::Plugin; "plugin")]
+fn queued_prompt_source_is_forwarded_to_agent_input(source: maki_agent::InputSource) {
+    const TEXT: &str = "synthetic queued prompt";
+    let app = test_app();
+    let mut message = queued_msg(TEXT);
+    message.source = source;
+    let input = app.build_agent_input(&message);
+    assert_eq!(input.source, source);
+    assert_eq!(input.message, TEXT);
+}
+
 #[test]
 fn workflow_toggle_flows_into_agent_input() {
     let mut app = test_app();
     let msg = QueuedMessage {
         text: "hi".into(),
         images: Vec::new(),
+        source: maki_agent::InputSource::Tui,
     };
     assert!(!app.build_agent_input(&msg).workflow);
 

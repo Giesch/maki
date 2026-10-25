@@ -235,6 +235,8 @@ pub async fn adapt_images_for_model<'a>(
             content,
             display_text: message.display_text.clone(),
             kind: message.kind.clone(),
+            human_prompt: message.human_prompt.clone(),
+            prompt_history_start: message.prompt_history_start,
         });
     }
     Cow::Owned(adapted)
@@ -373,6 +375,13 @@ pub struct Message {
     /// load unchanged.
     #[serde(default, skip_serializing_if = "MessageKind::is_turn")]
     pub kind: MessageKind,
+    /// Exact visible human text, recorded only at a trusted input boundary.
+    /// Missing on legacy messages and machine-generated turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_prompt: Option<String>,
+    /// Marks the beginning of a transcript recorded with prompt provenance.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prompt_history_start: bool,
 }
 
 impl Message {

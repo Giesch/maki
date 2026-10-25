@@ -1449,6 +1449,7 @@ impl<'t> EventLoop<'t> {
         let msg = QueuedMessage {
             text,
             images: Vec::new(),
+            source: maki_agent::InputSource::Plugin,
         };
         match self.sessions[idx].app.submit_prompt(msg) {
             SubmitOutcome::Started(actions) => {
